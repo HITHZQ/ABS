@@ -1,0 +1,120 @@
+##20260128
+add obstacles
+生成 8 个圆柱障碍物资产：在 go1/humanoid_env_cfg.py 里把原来的单个 cylinder 改成 cylinder_0…cylinder_7
+半径：0.4m（40cm）
+高度：1.0m（你没给高度，我先用 1m；需要的话可改）
+初始 z：0.5m（= 高度一半，确保落在地面上）
+每个 episode 随机 0–8 个障碍：新增 go1/mdp/events.py 里的 reset_cylinder_obstacles_curriculum()，在 reset 时：
+按 terrain level(0..9) 计算该 level 的 最大障碍数量上限（level 0→0，level 9→8）
+再在 
+[0,上限]
+[0,上限] 里均匀采样本 episode 的 实际障碍数量
+只“激活”前 N 个圆柱，其余的移动到很远处（等价于禁用）
+随机分布区域：用 11m×5m 矩形
+x_range=(-2.5, 8.5)（长度 11m，覆盖 origin(0) 和你当前 goal x 上界 ~7.5）
+y_range=(-2.5, 2.5)（宽度 5m）
+
+
+#在mdp.event中添加函数，并在main文件中调用 reset_cylinder_obstacles_curriculum
+
+from __future__ import annotations
+
+import math
+from typing import TYPE_CHECKING
+
+import torch
+
+import isaaclab.utils.math as math_utils
+from isaaclab.assets import RigidObject
+from isaaclab.managers import SceneEntityCfg
+
+if TYPE_CHECKING:
+    from isaaclab.envs import ManagerBasedEnv
+
+
+def reset_cylinder_obstacles_curriculum(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    obstacle_names: list[str],
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    num_levels: int,
+    max_obstacles: int,
+    out_of_bounds_offset: tuple[float, float, float] = (1000.0, 1000.0, -10.0),
+) -> None:
+    """Reset cylinder obstacles with a difficulty curriculum tied to terrain levels.
+
+    For each environment, sample a number of active obstacles in [0, max_obstacles_for_level],
+    where max_obstacles_for_level increases with terrain level (0..num_levels-1).
+
+    Active obstacles are uniformly distributed in the rectangle [x_range] x [y_range]
+    (in the local env frame, i.e. added on top of env origin + asset default position).
+
+    Inactive obstacles are moved far away to avoid interactions.
+    """
+    if len(obstacle_names) == 0:
+        return
+
+    
+    
+    # Resolve terrain levels (0..num_levels-1). If terrain isn't present, fall back to zeros.
+    terrain_levels = None
+    if hasattr(env.scene, "terrain") and hasattr(env.scene.terrain, "terrain_levels"):
+        terrain_levels = env.scene.terrain.terrain_levels
+
+    if terrain_levels is None:
+        levels = torch.zeros((len(env_ids),), dtype=torch.long, device=env.device)
+    else:
+        levels = terrain_levels[env_ids].to(dtype=torch.long)
+        levels = torch.clamp(levels, 0, max(0, num_levels - 1))
+
+    # Compute per-env max obstacles increasing with difficulty.
+    # level=0 -> 0, level=num_levels-1 -> max_obstacles
+    denom = max(1, num_levels - 1)
+    max_for_level = torch.floor(levels.to(torch.float32) / float(denom) * float(max_obstacles)).to(torch.long)
+    max_for_level = torch.clamp(max_for_level, 0, max_obstacles)
+
+    # Sample actual number of active obstacles uniformly in [0, max_for_level].
+    # torch.randint upper bound is exclusive, so we use (max_for_level + 1).
+    num_active = torch.zeros((len(env_ids),), dtype=torch.long, device=env.device)
+    has_any = max_for_level > 0
+    if torch.any(has_any):
+        num_active[has_any] = torch.randint(
+            low=0,
+            high=(max_for_level[has_any] + 1).to(torch.long),
+            size=(int(has_any.sum().item()),),
+            device=env.device,
+        )
+
+    # Common buffers
+    zeros_6 = torch.zeros((len(env_ids), 6), device=env.device)
+    identity_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=env.device).repeat(len(env_ids), 1)
+    oob_offset = torch.tensor(out_of_bounds_offset, device=env.device).view(1, 3)
+
+    # Place each obstacle (vectorized per obstacle across envs).
+    for i, name in enumerate(obstacle_names):
+        asset: RigidObject = env.scene[name]
+
+        # Start from default root pose (and add env origins like IsaacLab's reset_root_state_uniform).
+        root_state = asset.data.default_root_state[env_ids].clone()
+        base_pos = root_state[:, 0:3] + env.scene.env_origins[env_ids]
+
+        # Sample local offsets for active obstacles.
+        x = math_utils.sample_uniform(x_range[0], x_range[1], (len(env_ids),), device=env.device)
+        y = math_utils.sample_uniform(y_range[0], y_range[1], (len(env_ids),), device=env.device)
+        z = torch.zeros_like(x)  # keep default z (should already be cylinder half-height)
+
+        yaw = math_utils.sample_uniform(-math.pi, math.pi, (len(env_ids),), device=env.device)
+        quat = math_utils.quat_from_euler_xyz(torch.zeros_like(yaw), torch.zeros_like(yaw), yaw)
+
+        pose_active = torch.cat([base_pos + torch.stack([x, y, z], dim=-1), quat], dim=-1)
+        pose_inactive = torch.cat([base_pos + oob_offset, identity_quat], dim=-1)
+
+        # Activate first `num_active` obstacles per env.
+        active_mask = (torch.full((len(env_ids),), i, device=env.device, dtype=torch.long) < num_active).unsqueeze(-1)
+        pose = torch.where(active_mask, pose_active, pose_inactive)
+
+        asset.write_root_pose_to_sim(pose, env_ids=env_ids)
+        asset.write_root_velocity_to_sim(zeros_6, env_ids=env_ids)
+
+
