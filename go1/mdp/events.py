@@ -17,6 +17,44 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
 
+def reset_cylinder_obstacles_from_buffer(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    obstacle_names: list[str],
+    buffer_attr: str = "_test_obstacle_positions",
+    default_z: float = 0.25,
+) -> None:
+    """Reset cylinder obstacles from pre-computed positions stored on env.
+
+    Reads from env.<buffer_attr> of shape (num_envs, 2, num_obstacles) where
+    [:,0,:] = x, [:,1,:] = y in env local frame. Used for testbed evaluation.
+    """
+    if len(obstacle_names) == 0:
+        return
+
+    positions = getattr(env, buffer_attr, None)
+    if positions is None or positions.shape[2] < len(obstacle_names):
+        return
+
+    identity_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=env.device).repeat(len(env_ids), 1)
+    zeros_6 = torch.zeros((len(env_ids), 6), device=env.device)
+
+    for i, name in enumerate(obstacle_names):
+        if i >= positions.shape[2]:
+            break
+        asset: RigidObject = env.scene[name]
+        base_pos = env.scene.env_origins[env_ids].clone()
+        x = positions[env_ids, 0, i]
+        y = positions[env_ids, 1, i]
+        z = torch.full((len(env_ids),), default_z, device=env.device, dtype=torch.float32)
+        pose = torch.cat(
+            [base_pos + torch.stack([x, y, z], dim=-1), identity_quat],
+            dim=-1,
+        )
+        asset.write_root_pose_to_sim(pose, env_ids=env_ids)
+        asset.write_root_velocity_to_sim(zeros_6, env_ids=env_ids)
+
+
 def reset_cylinder_obstacles_curriculum(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
