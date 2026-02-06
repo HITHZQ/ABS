@@ -82,8 +82,8 @@ GO1_AGILE_TERRAINS_CFG = TerrainGeneratorCfg(
 ##
 
 @configclass
-class Go1PosSceneCfg(InteractiveSceneCfg):
-    """Configuration for the Go1 Position Tracking scene."""
+class Go1AgileSceneCfg(InteractiveSceneCfg):
+    """Scene configuration for the Go1 agile (position-tracking) task."""
 
     # 1. 地形 (Terrain): flat / rough / low stumbling blocks with curriculum (levels 0..9)
     terrain = TerrainImporterCfg(
@@ -600,10 +600,10 @@ class TerminationsCfg:
 ##
 
 @configclass
-class Go1PosRoughEnvCfg(ManagerBasedRLEnvCfg):
-    """Configuration for the Go1 Pos Rough environment."""
+class Go1AgileEnvCfg(ManagerBasedRLEnvCfg):
+    """Configuration for the Go1 agile (position-tracking) environment."""
     # Scene settings
-    scene: Go1PosSceneCfg = Go1PosSceneCfg(num_envs=1280, env_spacing=2.5)
+    scene: Go1AgileSceneCfg = Go1AgileSceneCfg(num_envs=1280, env_spacing=2.5)
     # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()

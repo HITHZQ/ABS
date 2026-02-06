@@ -28,8 +28,8 @@ from go1.agile import (
     ActionsCfg,
     CommandsCfg,
     EventCfg,
-    Go1PosRoughEnvCfg,
-    Go1PosSceneCfg,
+    Go1AgileEnvCfg,
+    Go1AgileSceneCfg,
     ObservationsCfg,
     RewardsCfg,
     TerminationsCfg,
@@ -156,10 +156,10 @@ class TestbedTerminationsCfg(TerminationsCfg):
 
 
 @configclass
-class Go1TestbedEnvCfg(Go1PosRoughEnvCfg):
+class Go1TestbedEnvCfg(Go1AgileEnvCfg):
     """Testbed config: flat terrain, test obstacle layout, command ranges."""
-    scene: Go1PosSceneCfg = replace(
-        Go1PosSceneCfg(),
+    scene: Go1AgileSceneCfg = replace(
+        Go1AgileSceneCfg(),
         num_envs=64,
         env_spacing=2.5,
     )
