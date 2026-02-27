@@ -20,11 +20,15 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 
 @configclass
-class HumanoidPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+class Go1AgilePPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """RSL-RL PPO runner configuration for the Go1 agile task."""
+
+    # 32 * 1280 * 1000 ≈ 40.96M env steps (default in docs is 4096 envs; here env_cfg uses 1280)
     num_steps_per_env = 32
     max_iterations = 1000
     save_interval = 100
-    experiment_name = "humanoid"
+    experiment_name = "go1_agile"
+
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_obs_normalization=True,
@@ -47,3 +51,10 @@ class HumanoidPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+# Keep a humanoid config for backwards compatibility with the RL framework
+# benchmarking scripts that expect a "humanoid" experiment.
+@configclass
+class HumanoidPPORunnerCfg(Go1AgilePPORunnerCfg):
+    experiment_name = "humanoid"

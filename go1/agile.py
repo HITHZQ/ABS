@@ -61,7 +61,9 @@ GO1_AGILE_TERRAINS_CFG = TerrainGeneratorCfg(
         # 2) Rough terrain: low-amplitude random grid heights
         "rough": MeshRandomGridTerrainCfg(
             proportion=0.33,
-            grid_width=0.25,
+            # grid_width must not perfectly tile size to keep a positive border width.
+            # With size=8.0, grid_width=0.24 → border_width ≈ 0.08 > 0.
+            grid_width=0.24,
             grid_height_range=(0.0, AGILE_TERRAIN_MAX_HEIGHT_DIFF_M / 2.0),
             platform_width=1.0,
             holes=False,
@@ -147,11 +149,12 @@ class Go1AgileSceneCfg(InteractiveSceneCfg):
         },
     )
 
-    # 3. 传感器 - 对应 Ray2d
+    # 3. 传感器 - 对应 Ray2d + 接触力
     lidar = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base", # 挂载在躯干上
         offset=RayCasterCfg.OffsetCfg(pos=(-0.05, 0.0, 0.0)), # 对应 x_0=-0.05
-        attach_yaw_only=True,
+        # align rays with robot yaw (replacement for deprecated attach_yaw_only)
+        ray_alignment="yaw",
         pattern_cfg=patterns.LidarPatternCfg(
             channels=1,
             vertical_fov_range=(0.0, 0.0),
@@ -164,53 +167,66 @@ class Go1AgileSceneCfg(InteractiveSceneCfg):
         mesh_prim_paths=["/World/ground"], # 射线只检测地形
     )
 
+    # Contact sensor on all robot links, used for termination and potential rewards.
+    contact_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/.*",
+        history_length=3,
+        track_air_time=True,
+    )
+
     # 4. 障碍物 (Cylinders)
     # Paper: 0~8 cylinders per episode, radius 40cm, uniformly placed in a 11m x 5m rectangle
     # covering origin and goal, with a curriculum (harder -> more obstacles).
     #
     # Implementation detail: we spawn 8 cylinders and at reset we activate a subset (others moved far away).
     cylinder_0 = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Obstacles/Cylinder_0",
+        prim_path="{ENV_REGEX_NS}/Cylinder_0",
         spawn=sim_utils.CylinderCfg(
             radius=0.4,
             height=1.0,
             mass_props=sim_utils.MassPropertiesCfg(50.0),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                disable_gravity=False,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(
+                collision_enabled=True,
+            ),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.6, 0.6, 0.6)),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(2.0, 2.0, 0.25)),
     )
     cylinder_1 = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Obstacles/Cylinder_1",
+        prim_path="{ENV_REGEX_NS}/Cylinder_1",
         spawn=cylinder_0.spawn,
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.5)),
     )
     cylinder_2 = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Obstacles/Cylinder_2",
+        prim_path="{ENV_REGEX_NS}/Cylinder_2",
         spawn=cylinder_0.spawn,
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.5)),
     )
     cylinder_3 = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Obstacles/Cylinder_3",
+        prim_path="{ENV_REGEX_NS}/Cylinder_3",
         spawn=cylinder_0.spawn,
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.5)),
     )
     cylinder_4 = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Obstacles/Cylinder_4",
+        prim_path="{ENV_REGEX_NS}/Cylinder_4",
         spawn=cylinder_0.spawn,
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.5)),
     )
     cylinder_5 = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Obstacles/Cylinder_5",
+        prim_path="{ENV_REGEX_NS}/Cylinder_5",
         spawn=cylinder_0.spawn,
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.5)),
     )
     cylinder_6 = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Obstacles/Cylinder_6",
+        prim_path="{ENV_REGEX_NS}/Cylinder_6",
         spawn=cylinder_0.spawn,
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.5)),
     )
     cylinder_7 = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Obstacles/Cylinder_7",
+        prim_path="{ENV_REGEX_NS}/Cylinder_7",
         spawn=cylinder_0.spawn,
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.5)),
     )
@@ -289,6 +305,8 @@ class EventCfg:
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
             "static_friction_range": (0.4, 1.1),
             "dynamic_friction_range": (0.4, 1.1),
+            # In line with other tasks (e.g., locomotion velocity), use a fixed restitution range.
+            "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
         },
     )
@@ -590,10 +608,11 @@ class TerminationsCfg:
     # 对应 terminate_after_contacts_on = ["base"]
     base_contact = TermTerm(
         func=mdp.illegal_contact,
-        params={"sensor_cfg": SceneEntityCfg("robot", body_names="trunk"), "threshold": 1.0},
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
     )
-    # Table II: Episode length U(7, 9) s — use 8.0 s midpoint; full U(7,9) needs custom termination
-    time_out = TermTerm(func=mdp.time_out, params={"time_out": 8.0})
+    # Table II: Episode length U(7, 9) s — we set fixed episode_length_s in env cfg and
+    # use the built-in time_out termination flag.
+    time_out = TermTerm(func=mdp.time_out, time_out=True)
 
 ##
 # Environment Config
@@ -622,6 +641,12 @@ class Go1AgileEnvCfg(ManagerBasedRLEnvCfg):
     def __post_init__(self):
         """Post initialization."""
         super().__post_init__()
+        # General timing settings: 200 Hz physics (dt=0.005), 4 control steps per action, 8 s episodes.
+        self.decimation = 4
+        self.episode_length_s = 8.0
+        # Keep sim config consistent with decimation.
+        self.sim.dt = 0.005
+        self.sim.render_interval = self.decimation
         # Viewer settings
         self.viewer.eye = (3.0, 3.0, 3.0)
         self.viewer.lookat = (0.0, 0.0, 0.0)

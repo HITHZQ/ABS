@@ -182,10 +182,18 @@ def foot_contacts(
                 force_magnitude = torch.linalg.norm(forces, dim=-1)  # (num_envs,)
                 contact_forces_list.append(force_magnitude)
             else:
-                # Fallback: try contact sensor
-                if "contact_forces" in env.scene:
-                    # Access via contact sensor - implementation depends on Isaac Lab version
-                    contact_forces_list.append(torch.zeros(env.num_envs, device=env.device))
+                # Fallback: try dedicated contact sensor collection
+                if "contact_forces" in env.scene.sensors:
+                    contact_sensor = env.scene.sensors["contact_forces"]
+                    # net_forces_w_history has shape (num_envs, history, num_bodies, 3)
+                    if hasattr(contact_sensor.data, "net_forces_w_history"):
+                        forces_hist = contact_sensor.data.net_forces_w_history[:, :, body_idx]  # (N, H, 3)
+                        force_mag = torch.linalg.norm(forces_hist, dim=-1)  # (N, H)
+                        # use max over history
+                        force_magnitude = torch.max(force_mag, dim=-1)[0]
+                        contact_forces_list.append(force_magnitude)
+                    else:
+                        contact_forces_list.append(torch.zeros(env.num_envs, device=env.device))
                 else:
                     contact_forces_list.append(torch.zeros(env.num_envs, device=env.device))
         else:

@@ -329,9 +329,9 @@ def undesired_contacts_comprehensive(
     
     # Get contact forces - try different methods depending on Isaac Lab version
     try:
-        # Method 1: Use contact sensor if available
-        if "contact_forces" in env.scene:
-            contact_sensor = env.scene["contact_forces"]
+        # Method 1: Use dedicated contact sensor if available
+        if "contact_forces" in env.scene.sensors:
+            contact_sensor = env.scene.sensors["contact_forces"]
             body_names = asset.body_names
             
             # 1. Check base collisions
@@ -404,6 +404,7 @@ def undesired_contacts_comprehensive(
                         total_penalty += torch.where(foot_horizontal_mag > horizontal_threshold, foot_horizontal_mag, torch.zeros_like(foot_horizontal_mag))
     
     except (AttributeError, KeyError, IndexError):
+        # Fallback: use the generic undesired_contacts reward from core MDP, wired to our contact_forces sensor.
         try:
             from isaaclab.envs.mdp import undesired_contacts
             bodies = f"{base_body_name}|{thigh_body_pattern}"
@@ -412,7 +413,7 @@ def undesired_contacts_comprehensive(
             base_thigh_calf_penalty = undesired_contacts(
                 env,
                 threshold=threshold,
-                sensor_cfg=SceneEntityCfg(asset_cfg.name, body_names=bodies),
+                sensor_cfg=SceneEntityCfg("contact_forces", body_names=bodies),
             )
             total_penalty += base_thigh_calf_penalty
         except (ImportError, AttributeError):
@@ -1108,7 +1109,7 @@ class regularization_reward(ManagerTermBase):
         n = env.num_envs
         j = asset.num_joints
         self.nj = j
-        self.device = env.device
+        
 
         # Torque limits (effort limits): (num_joints,) or (1, num_joints)
         tau_lim = asset.data.joint_effort_limits
