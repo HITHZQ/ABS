@@ -46,12 +46,11 @@ AGILE_TERRAIN_MAX_HEIGHT_DIFF_M = 0.07  # 7 cm
 GO1_AGILE_TERRAINS_CFG = TerrainGeneratorCfg(
     curriculum=True,
     difficulty_range=(0.0, 1.0),
-    # Each tile (sub-terrain) size in meters.
-    size=(8.0, 8.0),
-    # One row per curriculum level.
-    num_rows=AGILE_TERRAIN_LEVELS,
-    # More columns => more random variety at the same difficulty.
-    num_cols=20,
+    # Each tile (sub-terrain) size in meters. 必须是正方形，否则 MeshRandomGridTerrainCfg 会报错。
+    size=(11.0, 11.0),
+    # 行列数：64x64=4096 ≥ num_envs(1024)，每个 env 至少有一个 tile，不会挤在一起。
+    num_rows=40,
+    num_cols=40,
     horizontal_scale=0.1,
     vertical_scale=0.005,
     slope_threshold=0.75,
@@ -86,6 +85,9 @@ GO1_AGILE_TERRAINS_CFG = TerrainGeneratorCfg(
 @configclass
 class Go1AgileSceneCfg(InteractiveSceneCfg):
     """Scene configuration for the Go1 agile (position-tracking) task."""
+
+    # 1. 地形 (Terrain): flat / rough / low stumbling blocks with curriculum (levels 0..9)
+   
 
     # 1. 地形 (Terrain): flat / rough / low stumbling blocks with curriculum (levels 0..9)
     terrain = TerrainImporterCfg(
@@ -177,8 +179,7 @@ class Go1AgileSceneCfg(InteractiveSceneCfg):
     # 4. 障碍物 (Cylinders)
     # Paper: 0~8 cylinders per episode, radius 40cm, uniformly placed in a 11m x 5m rectangle
     # covering origin and goal, with a curriculum (harder -> more obstacles).
-    #
-    # Implementation detail: we spawn 8 cylinders and at reset we activate a subset (others moved far away).
+    # Cylinders are fixed obstacles: kinematic from spawn; startup event re-applies kinematic after clone.
     cylinder_0 = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Cylinder_0",
         spawn=sim_utils.CylinderCfg(
@@ -186,7 +187,8 @@ class Go1AgileSceneCfg(InteractiveSceneCfg):
             height=1.0,
             mass_props=sim_utils.MassPropertiesCfg(50.0),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                disable_gravity=False,
+                kinematic_enabled=True,
+                disable_gravity=True,
             ),
             collision_props=sim_utils.CollisionPropertiesCfg(
                 collision_enabled=True,
@@ -297,6 +299,18 @@ class ObservationsCfg:
 class EventCfg:
     """Domain randomization (Table II): Observation (illusion, noises), Dynamics (ERFI-50, friction, mass, biases), Episode (init, goal, length)."""
 
+    # Cylinders: force kinematic (fixed) at startup so they never move, even after clone/instancing.
+    set_cylinders_kinematic = EventTerm(
+        func=mdp.set_cylinders_kinematic_at_startup,
+        mode="startup",
+        params={
+            "obstacle_names": [
+                "cylinder_0", "cylinder_1", "cylinder_2", "cylinder_3",
+                "cylinder_4", "cylinder_5", "cylinder_6", "cylinder_7",
+            ],
+        },
+    )
+
     # Table II Dynamics: Friction factor U(0.4, 1.1)
     physics_material = EventTerm(
         func=mdp.randomize_rigid_body_material,
@@ -333,14 +347,15 @@ class EventCfg:
     )
 
     # Table II Episode: Initial x=0, y=0; yaw U(−π, π); twist U(−0.5, 0.5) m/s or rad/s
+    # Slightly reduced initial velocity (±0.25) to avoid immediate fall at episode start; z fixed for standing height.
     reset_base = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
-            "pose_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (-math.pi, math.pi)},
+            "pose_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.37, 0.37), "yaw": (-math.pi, math.pi)},
             "velocity_range": {
-                "x": (-0.5, 0.5), "y": (-0.5, 0.5), "z": (-0.5, 0.5),
-                "roll": (-0.5, 0.5), "pitch": (-0.5, 0.5), "yaw": (-0.5, 0.5),
+                "x": (-0.25, 0.25), "y": (-0.25, 0.25), "z": (-0.25, 0.25),
+                "roll": (-0.25, 0.25), "pitch": (-0.25, 0.25), "yaw": (-0.25, 0.25),
             },
         },
     )
@@ -379,6 +394,7 @@ class EventCfg:
     )
 
     # 障碍物重置 + curriculum：level 越高，障碍物上限越大（0..8）
+    # 网格放置保证同一 env 内圆柱互不重叠（grid_nx*grid_ny 个格点，每 env 随机选 8 个不同格点）。
     reset_cylinder_obstacles = EventTerm(
         func=mdp.reset_cylinder_obstacles_curriculum,
         mode="reset",
@@ -393,12 +409,13 @@ class EventCfg:
                 "cylinder_6",
                 "cylinder_7",
             ],
-            # 11m x 5m rectangle covering origin (x=0) and typical goal (x up to ~7.5)
-            # We use x in [-2.5, 8.5] and y in [-2.5, 2.5].
             "x_range": (-2.5, 8.5),
             "y_range": (-2.5, 2.5),
             "num_levels": 10,
             "max_obstacles": 8,
+            "min_obstacles": 0,
+            "grid_nx": 10,
+            "grid_ny": 5,
         },
     )
 
@@ -431,7 +448,7 @@ class RewardsCfg:
     # Undesired contacts: collisions on base, thighs, calves, and horizontal collisions on feet
     collision = RewTerm(
         func=mdp.undesired_contacts_comprehensive,
-        weight=-100.0, # 极大的惩罚
+        weight=-30.0,  # 仍然强烈，但不过度主导总奖励
         params={
             "threshold": 1.0,
             "horizontal_threshold": 1.0,
@@ -481,7 +498,7 @@ class RewardsCfg:
         params={
             "command_name": "pose_command",
             "sigma": 0.5,  # σtight = 0.5 m (normalization parameter, tighter than possoft)
-            "tr_steps": 1.0,  # Tr = 1 s (time threshold, shorter than possoft)
+            "tr_steps": 3.0,  # 放宽到 3 s，让精确跟踪更早产生 shaping
             "asset_cfg": SceneEntityCfg("robot"),
         },
     )
@@ -502,7 +519,7 @@ class RewardsCfg:
         params={
             "command_name": "pose_command",
             "sigma": 1.0,  # σheading = 1 rad (normalization parameter)
-            "tr_steps": 2.0,  # Tr = 2 s (time threshold)
+            "tr_steps": 4.0,  # 放宽到 4 s，让朝向奖励更早起作用
             "sigma_soft": 2.0,  # σsoft = 2 m (distance threshold to disable heading reward)
             "asset_cfg": SceneEntityCfg("robot"),
         },
@@ -519,10 +536,10 @@ class RewardsCfg:
     #   - q̄: nominal joint positions for standing
     stand = RewTerm(
         func=mdp.stand,
-        weight=-10.0,
+        weight=-3.0,  # 减弱姿态惩罚，避免“宁愿站好不愿意跑”
         params={
             "command_name": "pose_command",
-            "tr_stand": 1.0,  # Tr,stand = 1 s (time threshold)
+            "tr_stand": 2.0,  # 延长到 2 s，让站立 shaping 更平滑
             "sigma_tight": 0.5,  # σtight = 0.5 m (distance threshold)
             "asset_cfg": SceneEntityCfg("robot"),
             "nominal_joint_pos": {
@@ -553,7 +570,7 @@ class RewardsCfg:
     #   - σtight = 0.5 m (distance threshold, same as postight)
     agile = RewTerm(
         func=mdp.agile,
-        weight=10.0,
+        weight=20.0,  # 提高敏捷奖励权重，鼓励真正“跑起来”
         params={
             "command_name": "pose_command",
             "vmax": 4.5,  # vmax = 4.5 m/s (upper bound)
@@ -563,23 +580,18 @@ class RewardsCfg:
         },
     )
     # stall - Stall penalty to penalize robot for time waste
-    # Formula: r(stall) = 1 if (robot is static) AND (d_goal > σsoft) AND (not correct direction)
-    # 
-    # Purpose: Penalizes robot for staying static when far from goal and not heading toward goal.
-    #          This prevents the robot from wasting time by stalling when it should be moving.
-    # Conditions:
-    #   - Robot is static (velocity < threshold)
-    #   - d_goal > σsoft (2 m) - far from goal
-    #   - NOT correct direction (angle >= 105°) - not heading toward goal
+    # Formula: r(stall) = 1 if (robot is static) AND (d_goal > σsoft).
+    # penalize_static_when_facing_goal=True: penalize any static+far (avoids "face goal and stand still").
     stall = RewTerm(
         func=mdp.stall,
-        weight=-20.0,
+        weight=-25.0,  # 略微加大静止惩罚
         params={
             "command_name": "pose_command",
             "sigma_soft": 2.0,  # σsoft = 2 m (distance threshold)
-            "velocity_threshold": 0.1,  # Velocity threshold to consider static (m/s)
-            "correct_direction_threshold": 105.0,  # 105° angle threshold
+            "velocity_threshold": 0.05,  # 更严格地判定“几乎不动”
+            "correct_direction_threshold": 105.0,
             "asset_cfg": SceneEntityCfg("robot"),
+            "penalize_static_when_facing_goal": True,  # penalize static+far even when facing goal
         },
     )
     # -- Regularization reward (paper formula) --
@@ -622,7 +634,8 @@ class TerminationsCfg:
 class Go1AgileEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the Go1 agile (position-tracking) environment."""
     # Scene settings
-    scene: Go1AgileSceneCfg = Go1AgileSceneCfg(num_envs=1280, env_spacing=2.5)
+    # 2048 envs: fits 5070Ti 更稳，且与 terrain num_rows*num_cols=10*256=2560 匹配。
+    scene: Go1AgileSceneCfg = Go1AgileSceneCfg(num_envs=1024, env_spacing=2.5)
     # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()

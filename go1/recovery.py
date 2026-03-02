@@ -27,15 +27,46 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporterCfg
 from isaaclab.utils import configclass
-from isaaclab.terrains.trimesh.mesh_terrains_cfg import MeshPlaneTerrainCfg
+from isaaclab.terrains.height_field.hf_terrains_cfg import HfDiscreteObstaclesTerrainCfg
+from isaaclab.terrains.trimesh.mesh_terrains_cfg import MeshPlaneTerrainCfg, MeshRandomGridTerrainCfg
 from isaaclab.assets.articulation import ArticulationCfg
 from isaaclab.actuators import DCMotorCfg
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.utils.noise import GaussianNoiseCfg
 
-# Import MDP functions
-import isaaclab.envs.mdp as mdp
+# Import MDP functions (go1.mdp re-exports isaaclab.envs.mdp + go1-specific terms)
 import go1.mdp as mdp
+
+# Paper: terrain_types = ['flat', 'rough', 'low_obst'], proportions [0.5, 0.5, 0.5] → equal mix
+RECOVERY_TERRAIN_MAX_HEIGHT_DIFF_M = 0.07
+# num_rows * num_cols must be >= num_envs (4096) so each env has its own terrain cell.
+GO1_RECOVERY_TERRAINS_CFG = TerrainGeneratorCfg(
+    curriculum=False,
+    size=(8.0, 8.0),
+    num_rows=64,
+    num_cols=64,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    sub_terrains={
+        "flat": MeshPlaneTerrainCfg(proportion=0.34),
+        "rough": MeshRandomGridTerrainCfg(
+            proportion=0.33,
+            grid_width=0.24,
+            grid_height_range=(0.0, RECOVERY_TERRAIN_MAX_HEIGHT_DIFF_M / 2.0),
+            platform_width=1.0,
+            holes=False,
+        ),
+        "low_stumbling_blocks": HfDiscreteObstaclesTerrainCfg(
+            proportion=0.33,
+            obstacle_height_mode="fixed",
+            obstacle_width_range=(0.12, 0.4),
+            obstacle_height_range=(0.0, RECOVERY_TERRAIN_MAX_HEIGHT_DIFF_M),
+            num_obstacles=40,
+            platform_width=1.0,
+        ),
+    },
+)
 
 ##
 # Scene Configuration
@@ -43,21 +74,13 @@ import go1.mdp as mdp
 
 @configclass
 class Go1RecoverySceneCfg(InteractiveSceneCfg):
-    """Configuration for the Go1 Recovery scene - simplified for fast twist tracking."""
+    """Configuration for the Go1 Recovery scene. Paper: flat + rough + low_obst."""
 
-    # 1. Terrain: Flat ground only for fast recovery
+    # 1. Terrain: flat / rough / low_stumbling_blocks (paper terrain_types, equal proportions)
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",
-        terrain_generator=TerrainGeneratorCfg(
-            curriculum=False,
-            size=(8.0, 8.0),
-            num_rows=1,
-            num_cols=1,
-            sub_terrains={
-                "flat": MeshPlaneTerrainCfg(proportion=1.0),
-            },
-        ),
+        terrain_generator=GO1_RECOVERY_TERRAINS_CFG,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
@@ -68,7 +91,14 @@ class Go1RecoverySceneCfg(InteractiveSceneCfg):
         debug_vis=False,
     )
 
-    # 2. Robot - Go1 (same as agile)
+    # 2. Contact sensor (for termination and foot_contacts obs)
+    contact_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/.*",
+        history_length=3,
+        track_air_time=True,
+    )
+
+    # 3. Robot - Go1 (same as agile)
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="{ENV_REGEX_NS}/Robot",
         spawn=sim_utils.UsdFileCfg(
@@ -112,7 +142,7 @@ class Go1RecoverySceneCfg(InteractiveSceneCfg):
         },
     )
 
-    # 3. Light
+    # 4. Light
     light = AssetBaseCfg(
         prim_path="/World/light",
         spawn=sim_utils.DistantLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
@@ -192,6 +222,7 @@ class EventCfg:
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
             "static_friction_range": (0.4, 1.1),
             "dynamic_friction_range": (0.4, 1.1),
+            "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
         },
     )
@@ -205,15 +236,7 @@ class EventCfg:
         },
     )
 
-    push_robot = EventTerm(
-        func=mdp.push_by_setting_velocity,
-        mode="interval",
-        interval_range_s=(2.5, 2.5),
-        params={
-            "asset_cfg": SceneEntityCfg("robot"),
-            "velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)},
-        },
-    )
+    # Paper: push_robots = False (no push during recovery training)
 
     # Init: x=0, y=0; roll, pitch U(−π/6, π/6); yaw U(−π, π); vx U(−0.5, 5.5), vy,vz ±0.5; ω U(−1, 1)
     reset_base = EventTerm(
@@ -223,6 +246,7 @@ class EventCfg:
             "pose_range": {
                 "x": (0.0, 0.0),
                 "y": (0.0, 0.0),
+                "z": (0.37, 0.37),
                 "roll": (-math.pi / 6, math.pi / 6),
                 "pitch": (-math.pi / 6, math.pi / 6),
                 "yaw": (-math.pi, math.pi),
@@ -261,7 +285,7 @@ class CommandsCfg:
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
             lin_vel_x=(-1.5, 1.5),
             lin_vel_y=(-0.3, 0.3),
-            ang_vel_yaw=(-3.0, 3.0),
+            ang_vel_z=(-3.0, 3.0),
         ),
     )
 
@@ -336,9 +360,9 @@ class TerminationsCfg:
     """Recovery terminations. Base contact = fall (used for curriculum demotion). Episode 2 s."""
     base_contact = TermTerm(
         func=mdp.illegal_contact,
-        params={"sensor_cfg": SceneEntityCfg("robot", body_names="trunk"), "threshold": 1.0},
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
     )
-    time_out = TermTerm(func=mdp.time_out, params={"time_out": 2.0})
+    time_out = TermTerm(func=mdp.time_out, time_out=True)
 
 ##
 # Environment Config
@@ -349,7 +373,7 @@ class Go1RecoveryEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the Go1 Recovery environment - fast twist command tracking."""
     
     # Scene settings
-    scene: Go1RecoverySceneCfg = Go1RecoverySceneCfg(num_envs=1280, env_spacing=2.5)
+    scene: Go1RecoverySceneCfg = Go1RecoverySceneCfg(num_envs=4096, env_spacing=2.5)
     
     # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
@@ -370,6 +394,11 @@ class Go1RecoveryEnvCfg(ManagerBasedRLEnvCfg):
     def __post_init__(self):
         """Post initialization."""
         super().__post_init__()
+        # Recovery: 2 s episodes, same control rate as agile
+        self.decimation = 4
+        self.episode_length_s = 2.0
+        self.sim.dt = 0.005
+        self.sim.render_interval = self.decimation
         # Viewer settings
         self.viewer.eye = (3.0, 3.0, 3.0)
         self.viewer.lookat = (0.0, 0.0, 0.0)

@@ -9,12 +9,39 @@ from typing import TYPE_CHECKING
 
 import torch
 
+import isaaclab.sim.schemas as sim_schemas
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
+
+
+def set_cylinders_kinematic_at_startup(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    obstacle_names: list[str] | None = None,
+) -> None:
+    """Ensure all cylinder obstacles are kinematic (fixed) from the start. Call at startup."""
+    if obstacle_names is None:
+        obstacle_names = []
+    if isinstance(obstacle_names, str):
+        obstacle_names = [obstacle_names]
+    for name in obstacle_names:
+        if not isinstance(name, str) or not name.startswith("cylinder"):
+            continue
+        try:
+            asset = env.scene[name]
+        except KeyError:
+            continue
+        if not isinstance(asset, RigidObject):
+            continue
+        if not hasattr(asset, "root_physx_view"):
+            continue
+        cfg = sim_schemas.schemas_cfg.RigidBodyPropertiesCfg(kinematic_enabled=True, disable_gravity=True)
+        for path in asset.root_physx_view.prim_paths:
+            sim_schemas.modify_rigid_body_properties(path, cfg)
 
 
 def reset_cylinder_obstacles_from_buffer(
@@ -64,16 +91,19 @@ def reset_cylinder_obstacles_curriculum(
     num_levels: int,
     max_obstacles: int,
     out_of_bounds_offset: tuple[float, float, float] = (1000.0, 1000.0, -10.0),
+    min_obstacles: int = 0,
+    grid_nx: int = 10,
+    grid_ny: int = 5,
 ) -> None:
     """Reset cylinder obstacles with a difficulty curriculum tied to terrain levels.
 
     For each environment, sample a number of active obstacles in [0, max_obstacles_for_level],
     where max_obstacles_for_level increases with terrain level (0..num_levels-1).
 
-    Active obstacles are uniformly distributed in the rectangle [x_range] x [y_range]
-    (in the local env frame, i.e. added on top of env origin + asset default position).
+    If min_obstacles > 0 (e.g. for play/eval), at least that many obstacles are shown per env.
 
-    Inactive obstacles are moved far away to avoid interactions.
+    Obstacles are placed on a grid of slots so that no two cylinders overlap in the same env:
+    grid_nx * grid_ny slots in [x_range] x [y_range]; each env gets num_active distinct slots.
     """
     if len(obstacle_names) == 0:
         return
@@ -90,13 +120,10 @@ def reset_cylinder_obstacles_curriculum(
         levels = torch.clamp(levels, 0, max(0, num_levels - 1))
 
     # Compute per-env max obstacles increasing with difficulty.
-    # level=0 -> 0, level=num_levels-1 -> max_obstacles
     denom = max(1, num_levels - 1)
     max_for_level = torch.floor(levels.to(torch.float32) / float(denom) * float(max_obstacles)).to(torch.long)
     max_for_level = torch.clamp(max_for_level, 0, max_obstacles)
 
-    # Sample actual number of active obstacles uniformly in [0, max_for_level].
-    # torch.randint upper bound is exclusive, so we use (max_for_level + 1).
     num_active = torch.zeros((len(env_ids),), dtype=torch.long, device=env.device)
     has_any = max_for_level > 0
     if torch.any(has_any):
@@ -106,32 +133,52 @@ def reset_cylinder_obstacles_curriculum(
             size=(int(has_any.sum().item()),),
             device=env.device,
         )
+    if min_obstacles > 0:
+        min_n = min(min_obstacles, max_obstacles)
+        num_active = torch.maximum(num_active, torch.full_like(num_active, min_n))
 
-    # Common buffers
+    # Grid of slot centers so cylinders never overlap (each env: distinct slots).
+    num_slots = grid_nx * grid_ny
+    if num_slots < len(obstacle_names):
+        grid_ny = max(grid_ny, (len(obstacle_names) + grid_nx - 1) // grid_nx)
+        num_slots = grid_nx * grid_ny
+    xs = torch.linspace(
+        x_range[0] + (x_range[1] - x_range[0]) / (2 * grid_nx),
+        x_range[1] - (x_range[1] - x_range[0]) / (2 * grid_nx),
+        grid_nx,
+        device=env.device,
+    )
+    ys = torch.linspace(
+        y_range[0] + (y_range[1] - y_range[0]) / (2 * grid_ny),
+        y_range[1] - (y_range[1] - y_range[0]) / (2 * grid_ny),
+        grid_ny,
+        device=env.device,
+    )
+    grid_x, grid_y = torch.meshgrid(xs, ys, indexing="ij")
+    slot_centers = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1)], dim=-1)  # (num_slots, 2)
+
+    # Per-env random permutation of slot indices so each obstacle gets a distinct slot.
+    perm = torch.argsort(torch.rand(len(env_ids), num_slots, device=env.device), dim=1)  # (len(env_ids), num_slots)
+
     zeros_6 = torch.zeros((len(env_ids), 6), device=env.device)
     identity_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=env.device).repeat(len(env_ids), 1)
     oob_offset = torch.tensor(out_of_bounds_offset, device=env.device).view(1, 3)
 
-    # Place each obstacle (vectorized per obstacle across envs).
     for i, name in enumerate(obstacle_names):
         asset: RigidObject = env.scene[name]
-
-        # Start from default root pose (and add env origins like IsaacLab's reset_root_state_uniform).
         root_state = asset.data.default_root_state[env_ids].clone()
         base_pos = root_state[:, 0:3] + env.scene.env_origins[env_ids]
 
-        # Sample local offsets for active obstacles.
-        x = math_utils.sample_uniform(x_range[0], x_range[1], (len(env_ids),), device=env.device)
-        y = math_utils.sample_uniform(y_range[0], y_range[1], (len(env_ids),), device=env.device)
-        z = torch.zeros_like(x)  # keep default z (should already be cylinder half-height)
-
+        # Each env gets a distinct slot for this obstacle index (no overlap).
+        slot_idx = perm[:, i]  # (len(env_ids),)
+        local_xy = slot_centers[slot_idx]  # (len(env_ids), 2)
+        z = torch.zeros(len(env_ids), device=env.device)
         yaw = math_utils.sample_uniform(-math.pi, math.pi, (len(env_ids),), device=env.device)
         quat = math_utils.quat_from_euler_xyz(torch.zeros_like(yaw), torch.zeros_like(yaw), yaw)
 
-        pose_active = torch.cat([base_pos + torch.stack([x, y, z], dim=-1), quat], dim=-1)
+        pose_active = torch.cat([base_pos + torch.stack([local_xy[:, 0], local_xy[:, 1], z], dim=-1), quat], dim=-1)
         pose_inactive = torch.cat([base_pos + oob_offset, identity_quat], dim=-1)
 
-        # Activate first `num_active` obstacles per env.
         active_mask = (torch.full((len(env_ids),), i, device=env.device, dtype=torch.long) < num_active).unsqueeze(-1)
         pose = torch.where(active_mask, pose_active, pose_inactive)
 

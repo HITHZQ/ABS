@@ -258,7 +258,9 @@ def alive_bonus(env: ManagerBasedRLEnv) -> torch.Tensor:
     m = getattr(env, "termination_manager", None)
     if m is None:
         return torch.ones(env.num_envs, device=env.device)
-    t = getattr(m, "terminated", None) or getattr(m, "_terminated_buf", None)
+    t = getattr(m, "terminated", None)
+    if t is None:
+        t = getattr(m, "_terminated_buf", None)
     if t is None:
         return torch.ones(env.num_envs, device=env.device)
     return 1.0 - t.float()
@@ -992,31 +994,25 @@ def stall(
     velocity_threshold: float = 0.1,
     correct_direction_threshold: float = 105.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    penalize_static_when_facing_goal: bool = True,
 ) -> torch.Tensor:
     """Stall penalty to penalize robot for time waste.
     
-    Formula: r(stall) = 1 if (robot is static) AND (d_goal > σsoft) AND (not correct direction)
+    When penalize_static_when_facing_goal=True (recommended): 
+    r(stall) = 1 if (robot is static) AND (d_goal > σsoft).
+    This avoids the local optimum of "face goal and stand still".
     
-    This term penalizes the robot for staying static when:
-    - Far from goal (d_goal > σsoft = 2 m)
-    - Not heading toward goal (angle >= 105°)
-    
-    This prevents the robot from wasting time by stalling when it should be moving.
-    
-    Where:
-    - static: robot velocity below threshold (default: 0.1 m/s)
-    - d_goal: distance to goal
-    - σsoft: distance threshold (default: 2.0 m)
-    - correct direction: angle between robot heading and robot-goal line < threshold (default: 105°)
-    - NOT correct direction: angle >= threshold
+    When penalize_static_when_facing_goal=False (paper original):
+    r(stall) = 1 if (robot is static) AND (d_goal > σsoft) AND (not correct direction).
     
     Args:
         env: The environment instance.
         command_name: Name of the command (pose_command).
         sigma_soft: Distance threshold σsoft in meters. Default: 2.0 m.
         velocity_threshold: Velocity threshold to consider robot as static (m/s). Default: 0.1 m/s.
-        correct_direction_threshold: Angle threshold in degrees. Default: 105°.
+        correct_direction_threshold: Angle threshold in degrees (used only if penalize_static_when_facing_goal=False).
         asset_cfg: Configuration for the robot asset.
+        penalize_static_when_facing_goal: If True, penalize any static+far; if False, only when not facing goal.
     
     Returns:
         Stall penalty (1.0 if stalling conditions met, 0.0 otherwise).
@@ -1040,43 +1036,35 @@ def stall(
     distance_to_goal = torch.linalg.norm(error_2d, dim=-1)  # (num_envs,)
     
     # Check if robot is static (low velocity)
-    # Get linear velocity magnitude in world frame
-    base_lin_vel_w = asset.data.root_lin_vel_w[:, :2]  # (num_envs, 2) - x, y components
+    base_lin_vel_w = asset.data.root_lin_vel_w[:, :2]  # (num_envs, 2)
     velocity_magnitude = torch.linalg.norm(base_lin_vel_w, dim=-1)  # (num_envs,)
     is_static = velocity_magnitude < velocity_threshold  # (num_envs,)
     
     # Check if distance to goal > σsoft
     is_far_from_goal = distance_to_goal > sigma_soft  # (num_envs,)
     
-    # Check if NOT in correct direction (angle >= threshold)
-    base_quat = asset.data.root_quat_w
-    
-    # Robot heading direction (forward in base frame, transformed to world)
-    cos_yaw = base_quat[:, 0]**2 + base_quat[:, 3]**2 - base_quat[:, 1]**2 - base_quat[:, 2]**2
-    sin_yaw = 2 * (base_quat[:, 0] * base_quat[:, 3] + base_quat[:, 1] * base_quat[:, 2])
-    robot_heading_vec = torch.stack([cos_yaw, sin_yaw], dim=-1)  # (num_envs, 2)
-    
-    # Robot-goal direction vector
-    to_goal_vec = target_pos_2d - current_pos  # (num_envs, 2)
-    to_goal_norm = torch.linalg.norm(to_goal_vec, dim=-1, keepdim=True)  # (num_envs, 1)
-    to_goal_dir = torch.where(
-        to_goal_norm > 1e-6,
-        to_goal_vec / to_goal_norm,
-        torch.zeros_like(to_goal_vec)
-    )  # (num_envs, 2)
-    
-    # Compute angle between robot heading and goal direction
-    dot_product = torch.sum(robot_heading_vec * to_goal_dir, dim=-1)  # (num_envs,)
-    dot_product = torch.clamp(dot_product, -1.0, 1.0)
-    angle_rad = torch.acos(dot_product)  # (num_envs,) - angle in radians
-    angle_deg = angle_rad * 180.0 / math.pi  # (num_envs,) - angle in degrees
-    
-    # NOT in correct direction: angle >= threshold (105°)
-    not_correct_direction = angle_deg >= correct_direction_threshold  # (num_envs,)
-    
-    # Stall penalty: 1 if all conditions are met
-    # (static) AND (far from goal) AND (not correct direction)
-    stall_penalty = (is_static & is_far_from_goal & not_correct_direction).float()  # (num_envs,)
+    if penalize_static_when_facing_goal:
+        # Penalize whenever static and far (avoids "face goal and stand still" local optimum)
+        stall_penalty = (is_static & is_far_from_goal).float()  # (num_envs,)
+    else:
+        # Original: only penalize when also not facing goal
+        base_quat = asset.data.root_quat_w
+        cos_yaw = base_quat[:, 0]**2 + base_quat[:, 3]**2 - base_quat[:, 1]**2 - base_quat[:, 2]**2
+        sin_yaw = 2 * (base_quat[:, 0] * base_quat[:, 3] + base_quat[:, 1] * base_quat[:, 2])
+        robot_heading_vec = torch.stack([cos_yaw, sin_yaw], dim=-1)  # (num_envs, 2)
+        to_goal_vec = target_pos_2d - current_pos  # (num_envs, 2)
+        to_goal_norm = torch.linalg.norm(to_goal_vec, dim=-1, keepdim=True)  # (num_envs, 1)
+        to_goal_dir = torch.where(
+            to_goal_norm > 1e-6,
+            to_goal_vec / to_goal_norm,
+            torch.zeros_like(to_goal_vec),
+        )  # (num_envs, 2)
+        dot_product = torch.sum(robot_heading_vec * to_goal_dir, dim=-1)  # (num_envs,)
+        dot_product = torch.clamp(dot_product, -1.0, 1.0)
+        angle_rad = torch.acos(dot_product)  # (num_envs,)
+        angle_deg = angle_rad * 180.0 / math.pi  # (num_envs,)
+        not_correct_direction = angle_deg >= correct_direction_threshold  # (num_envs,)
+        stall_penalty = (is_static & is_far_from_goal & not_correct_direction).float()  # (num_envs,)
 
     return stall_penalty
 
