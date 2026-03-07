@@ -49,8 +49,8 @@ GO1_AGILE_TERRAINS_CFG = TerrainGeneratorCfg(
     # Each tile (sub-terrain) size in meters. 必须是正方形，否则 MeshRandomGridTerrainCfg 会报错。
     size=(11.0, 11.0),
     # 行列数：64x64=4096 ≥ num_envs(1024)，每个 env 至少有一个 tile，不会挤在一起。
-    num_rows=40,
-    num_cols=40,
+    num_rows=24,
+    num_cols=24,
     horizontal_scale=0.1,
     vertical_scale=0.005,
     slope_threshold=0.75,
@@ -247,10 +247,10 @@ class Go1AgileSceneCfg(InteractiveSceneCfg):
 class ActionsCfg:
     """Action specifications for the environment."""
     joint_pos = mdp.JointPositionActionCfg(
-        asset_name="robot", 
-        joint_names=[".*"], 
-        scale=0.25, # 对应 action_scale
-        use_default_offset=True
+        asset_name="robot",
+        joint_names=[".*"],
+        scale=0.2,  # 略降以利稳定移动，减少大幅摆动
+        use_default_offset=True,
     )
 
 ##
@@ -342,12 +342,18 @@ class EventCfg:
         interval_range_s=(2.5, 2.5),
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)},
+            "velocity_range": {"x": (-0.35, 0.35), "y": (-0.35, 0.35)},
         },
     )
 
+    # 先恢复关节与 root 到 init_state 默认姿态，避免上一条 episode 结束时单腿姿态异常被保留
+    reset_scene_to_default = EventTerm(
+        func=mdp.reset_scene_to_default,
+        mode="reset",
+        params={"reset_joint_targets": True},
+    )
     # Table II Episode: Initial x=0, y=0; yaw U(−π, π); twist U(−0.5, 0.5) m/s or rad/s
-    # Slightly reduced initial velocity (±0.25) to avoid immediate fall at episode start; z fixed for standing height.
+    # 再在默认姿态上随机化 root 位姿与速度
     reset_base = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
@@ -412,7 +418,7 @@ class EventCfg:
             "x_range": (-2.5, 8.5),
             "y_range": (-2.5, 2.5),
             "num_levels": 10,
-            "max_obstacles": 8,
+            "max_obstacles": 2,  # 前期少障碍便于先学会接近目标，稳定后可改回 8
             "min_obstacles": 0,
             "grid_nx": 10,
             "grid_ny": 5,
@@ -431,7 +437,7 @@ class CommandsCfg:
         resampling_time_range=(5.0, 5.0),
         simple_heading=False,
         ranges=mdp.UniformPose2dCommandCfg.Ranges(
-            pos_x=(1.5, 7.5),   # Table II: x_goal ~ U(1.5, 7.5) m
+            pos_x=(1.0, 4.0),   # 先缩小范围便于学到“到达”，稳定后再改回 (1.5, 7.5)
             pos_y=(-2.0, 2.0), # Table II: y_goal ~ U(−2, 2) m
             heading=(-0.3, 0.3),  # Table II: arctan2(y_goal,x_goal) + U(−0.3, 0.3); approx via indep.
         ),
@@ -443,12 +449,17 @@ class CommandsCfg:
 
 @configclass
 class RewardsCfg:
-    """Reward terms for the environment."""
+    """Reward terms for the environment.
+
+    Design: Penalties (collision -25, stall -25, stand -3, reg 2.5). Task: distance_to_goal 120,
+    possoft/postight 60 (last 5s/4s), heading 30 (last 6s when d≤5.5m), agile 50, upright 5.5.
+    Position/heading use world-frame target from pose command.
+    """
     # -- Penalty Rewards --
-    # Undesired contacts: collisions on base, thighs, calves, and horizontal collisions on feet
+    # Undesired contacts: base, thighs, calves, horizontal foot
     collision = RewTerm(
         func=mdp.undesired_contacts_comprehensive,
-        weight=-30.0,  # 仍然强烈，但不过度主导总奖励
+        weight=-25.0,  # 降低以免完全压制 distance_to_goal/agile，等策略会接近目标后再酌情提高
         params={
             "threshold": 1.0,
             "horizontal_threshold": 1.0,
@@ -461,6 +472,16 @@ class RewardsCfg:
     )
     
     # -- Task Rewards --
+    # Dense approach reward: 每步根据到目标距离给奖，越近越大，无时间窗口
+    distance_to_goal = RewTerm(
+        func=mdp.distance_to_goal_reward,
+        weight=90.0,  # 进一步加大，使“接近目标”梯度更明显
+        params={
+            "command_name": "pose_command",
+            "sigma": 6.5,  # 6.5 m 尺度，4～6 m 时仍有较大梯度
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
     # 对应 reach_pos_target_soft = 60.0 (使用 L2 距离的 exp 形式近似 soft)
     # possoft - Soft position tracking to encourage exploration for goal reaching
     # Formula: r(possoft) = 1/(1+||error/sigma||^2) * (1/Tr) * (if t>T-Tr)
@@ -477,8 +498,8 @@ class RewardsCfg:
         weight=60.0,
         params={
             "command_name": "pose_command",
-            "sigma": 2.0,  # σsoft = 2 m (normalization parameter)
-            "tr_steps": 2.0,  # Tr = 2 s (time threshold)
+            "sigma": 4.0,  # 放宽到 4 m，与当前 error~3 m 匹配，最后几秒内能明显给奖
+            "tr_steps": 5.0,  # 最后 5 s 均生效，增大触发窗口
             "asset_cfg": SceneEntityCfg("robot"),
         },
     )
@@ -497,8 +518,8 @@ class RewardsCfg:
         weight=60.0,
         params={
             "command_name": "pose_command",
-            "sigma": 0.5,  # σtight = 0.5 m (normalization parameter, tighter than possoft)
-            "tr_steps": 3.0,  # 放宽到 3 s，让精确跟踪更早产生 shaping
+            "sigma": 1.5,  # 1.5 m 尺度，在 d~2–3 m 时也有一定奖励
+            "tr_steps": 4.0,  # 最后 4 s 生效
             "asset_cfg": SceneEntityCfg("robot"),
         },
     )
@@ -519,8 +540,8 @@ class RewardsCfg:
         params={
             "command_name": "pose_command",
             "sigma": 1.0,  # σheading = 1 rad (normalization parameter)
-            "tr_steps": 4.0,  # 放宽到 4 s，让朝向奖励更早起作用
-            "sigma_soft": 2.0,  # σsoft = 2 m (distance threshold to disable heading reward)
+            "tr_steps": 6.0,  # 最后 6 s 均给朝向奖，与 8 s episode 匹配，确保能触发
+            "sigma_soft": 5.5,  # 5.5 m 内算接近（error_pos_2d~2.6 时稳定触发）
             "asset_cfg": SceneEntityCfg("robot"),
         },
     )
@@ -539,8 +560,8 @@ class RewardsCfg:
         weight=-3.0,  # 减弱姿态惩罚，避免“宁愿站好不愿意跑”
         params={
             "command_name": "pose_command",
-            "tr_stand": 2.0,  # 延长到 2 s，让站立 shaping 更平滑
-            "sigma_tight": 0.5,  # σtight = 0.5 m (distance threshold)
+            "tr_stand": 3.0,  # 最后 3 s 内生效，与 8 s episode 匹配
+            "sigma_tight": 3.5,  # 3.5 m 内罚站姿（error_pos_2d~2.6 时能触发）
             "asset_cfg": SceneEntityCfg("robot"),
             "nominal_joint_pos": {
                 "FL_hip_joint": 0.0,
@@ -558,26 +579,30 @@ class RewardsCfg:
             },
         },
     )
-    # agile - Agile reward to encourage fast forward motion or staying at goal
-    # Formula: r(agile) = max{relu(vx/vmax) * 1(correct direction), 1(d_goal < σtight)}
-    # 
-    # Purpose: Encourages robot to either run fast forward in correct direction or stay at goal.
-    #          To maximize this term, the robot has to either run fast or stay at the goal.
-    # Parameters:
-    #   - vx: forward velocity in robot base frame
-    #   - vmax = 4.5 m/s (upper bound of forward velocity, cannot be reached)
-    #   - correct direction: angle between robot heading and robot-goal line < 105°
-    #   - σtight = 0.5 m (distance threshold, same as postight)
+    # agile - 鼓励朝目标快速移动或已到达；实现中增加“朝目标速度分量”，任意朝向只要往目标走就给奖
+    # Formula: r = max{ max(relu(vx)*1(朝向正确), relu(vel_toward_goal/vmax)), 1(d < σtight) }
     agile = RewTerm(
         func=mdp.agile,
-        weight=20.0,  # 提高敏捷奖励权重，鼓励真正“跑起来”
+        weight=30.0,  # 提高权重，与 distance_to_goal 一起强化“迅速接近目标”
         params={
             "command_name": "pose_command",
-            "vmax": 4.5,  # vmax = 4.5 m/s (upper bound)
-            "sigma_tight": 0.5,  # σtight = 0.5 m (distance threshold)
-            "correct_direction_threshold": 105.0,  # 105° angle threshold
+            "vmax": 3.0,  # 略降使中等速度即可拿满归一化奖励，更易学到“动起来”
+            "sigma_tight": 0.8,  # 稍放宽“已到达”判定，0.8 m 内即给满奖
+            "correct_direction_threshold": 120.0,  # 放宽到 120°，略偏朝目标也有奖
             "asset_cfg": SceneEntityCfg("robot"),
         },
+    )
+    # Upright posture bonus: 每步奖励躯干保持竖直，促进四足稳定站立与移动
+    upright = RewTerm(
+        func=mdp.upright_posture_bonus,
+        weight=8.0,
+        params={"threshold": 0.92, "asset_cfg": SceneEntityCfg("robot")},
+    )
+    # 腿对称奖励：惩罚四条腿姿态差异，避免单腿抬起或蜷缩
+    leg_symmetry = RewTerm(
+        func=mdp.leg_symmetry_reward,
+        weight=4.0,
+        params={"asset_cfg": SceneEntityCfg("robot")},
     )
     # stall - Stall penalty to penalize robot for time waste
     # Formula: r(stall) = 1 if (robot is static) AND (d_goal > σsoft).
@@ -594,13 +619,12 @@ class RewardsCfg:
             "penalize_static_when_facing_goal": True,  # penalize static+far even when facing goal
         },
     )
-    # -- Regularization reward (paper formula) --
-    # r(reg) = -2·v_z² - 0.05·(ω_x²+ω_y²) - 20·(g_x²+g_y²)
-    #          - 0.0005·‖τ‖² - 20·Σ ReLU(|τ_i|-0.85·τ_lim) - 0.0005·‖q̇‖² - 20·Σ ReLU(|q̇_i|-0.9·q̇_lim)
-    #          - 20·Σ ReLU(|q_i|-0.95·q_lim) - 2e-7·‖q̈‖² - 4e-6·‖ȧ‖² - 20·1(fly)
+    # -- Regularization reward (paper formula) —
+    # 提高权重以强化稳定：抑制倾斜、离地、关节超限，利于四足稳定站立与移动
+    # r(reg) = -2·v_z² - 0.05·(ω_x²+ω_y²) - 20·(g_x²+g_y²) - ... - 20·1(fly)
     regularization = RewTerm(
         func=mdp.regularization_reward,
-        weight=1.0,
+        weight=4.0,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "velocity_limit": 31.4159,
@@ -635,7 +659,7 @@ class Go1AgileEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the Go1 agile (position-tracking) environment."""
     # Scene settings
     # 2048 envs: fits 5070Ti 更稳，且与 terrain num_rows*num_cols=10*256=2560 匹配。
-    scene: Go1AgileSceneCfg = Go1AgileSceneCfg(num_envs=1024, env_spacing=2.5)
+    scene: Go1AgileSceneCfg = Go1AgileSceneCfg(num_envs=512, env_spacing=2.5)
     # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()

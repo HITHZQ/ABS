@@ -25,7 +25,7 @@ class Go1AgilePPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     # 32 * 1280 * 1000 ≈ 40.96M env steps (default in docs is 4096 envs; here env_cfg uses 1280)
     num_steps_per_env = 32
-    max_iterations = 1000
+    max_iterations = 10000
     save_interval = 100
     experiment_name = "go1_agile"
 

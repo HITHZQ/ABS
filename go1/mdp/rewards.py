@@ -9,6 +9,11 @@ import torch
 from typing import TYPE_CHECKING
 
 import isaaclab.utils.math as math_utils
+
+# Temporary debug: log heading/stand mask means every N calls (set to 0 to disable)
+_DEBUG_HEADING_STAND_LOG_INTERVAL = 5000
+_DEBUG_heading_calls = [0]
+_DEBUG_stand_calls = [0]
 import isaaclab.utils.string as string_utils
 from isaaclab.assets import Articulation
 from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
@@ -17,6 +22,22 @@ from . import observations as obs
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+
+def _get_pose_command_world(env: "ManagerBasedRLEnv", command_name: str):
+    """Get target position (2D) and heading in world frame from pose command term.
+
+    get_command() returns base-frame command; pose term stores world-frame in pos_command_w
+    and heading_command_w. Use this so distance_to_goal matches Metrics/error_pos_2d.
+    Returns (target_pos_2d, target_heading) or (None, None) if term has no world data.
+    """
+    try:
+        term = env.command_manager.get_term(command_name)
+        if hasattr(term, "pos_command_w") and hasattr(term, "heading_command_w"):
+            return term.pos_command_w[:, :2].clone(), term.heading_command_w.clone()
+    except (KeyError, AttributeError):
+        pass
+    return None, None
 
 
 def upright_posture_bonus(
@@ -424,6 +445,39 @@ def undesired_contacts_comprehensive(
     return total_penalty
 
 
+def leg_symmetry_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward for keeping all four legs in similar configuration (penalize variance across legs).
+
+    Reduces the tendency for one leg to diverge from the other three (e.g. one leg lifted or curled).
+    r = -(var(hip_angles) + var(thigh_angles) + var(calf_angles)) over the 4 legs.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_names = list(asset.joint_names)
+    q = asset.data.joint_pos  # (num_envs, num_joints)
+    # Resolve indices by name (support any joint order from USD)
+    leg_joint_patterns = [
+        ("FL_hip_joint", "FR_hip_joint", "RL_hip_joint", "RR_hip_joint"),
+        ("FL_thigh_joint", "FR_thigh_joint", "RL_thigh_joint", "RR_thigh_joint"),
+        ("FL_calf_joint", "FR_calf_joint", "RL_calf_joint", "RR_calf_joint"),
+    ]
+    total_var = torch.zeros(env.num_envs, device=env.device)
+    for names in leg_joint_patterns:
+        indices = []
+        for name in names:
+            if name in joint_names:
+                indices.append(joint_names.index(name))
+        if len(indices) != 4:
+            continue
+        # (num_envs, 4)
+        group = q[:, indices]
+        var_per_env = group.var(dim=1)
+        total_var = total_var + var_per_env
+    return -total_var.clamp(min=0.0)
+
+
 def possoft(
     env: ManagerBasedRLEnv,
     command_name: str = "pose_command",
@@ -463,65 +517,59 @@ def possoft(
         Soft position tracking reward (scaled by 1/Tr, only active in last Tr seconds).
     """
     asset: Articulation = env.scene[asset_cfg.name]
-    
-    # Get target position from command
-    # For pose commands, format is typically [x, y, heading] or [x, y, z, heading]
-    cmd = env.command_manager.get_command(command_name)  # shape (N, 3) or (N, 4)
-    
-    # Extract target x, y (first two components)
-    if cmd.shape[1] >= 2:
-        target_pos_2d = cmd[:, :2]  # (num_envs, 2)
-    else:
-        target_pos_2d = cmd[:, :2]  # Fallback
-    
-    # Get current robot position (x, y only for 2D navigation)
+    target_pos_2d, _ = _get_pose_command_world(env, command_name)
+    if target_pos_2d is None:
+        return torch.zeros(env.num_envs, device=env.device)
     current_pos = asset.data.root_pos_w[:, :2]  # (num_envs, 2)
-    
-    # Compute position error
-    error_2d = current_pos - target_pos_2d  # (num_envs, 2)
+    error_2d = current_pos - target_pos_2d
     error_norm = torch.linalg.norm(error_2d, dim=-1)  # (num_envs,)
-    
-    # Soft function: 1/(1 + (error/sigma)^2)
     soft_reward = 1.0 / (1.0 + torch.square(error_norm / sigma))
-    
-    # Get episode time information
-    # Check if we're in the last Tr seconds of the episode
+    # Get episode time: episode_length_buf is ELAPSED steps (increments each step in ManagerBasedRLEnv)
     try:
-        # Get episode length from termination config
-        episode_length_s = 9.0  # Default
-        if hasattr(env, "cfg") and hasattr(env.cfg, "terminations"):
-            if hasattr(env.cfg.terminations, "time_out"):
-                if hasattr(env.cfg.terminations.time_out, "params"):
-                    episode_length_s = env.cfg.terminations.time_out.params.get("time_out", 9.0)
-        
-        # Get current time in episode
-        # In Isaac Lab, episode_length_buf typically counts remaining steps
+        # Use same T as time_out (max_episode_length * step_dt) so "last Tr seconds" matches env
+        if hasattr(env, "max_episode_length") and hasattr(env, "step_dt"):
+            episode_length_s = float(env.max_episode_length) * env.step_dt
+        else:
+            episode_length_s = getattr(env, "max_episode_length_s", 8.0)
         current_time_s = None
         if hasattr(env, "episode_length_buf"):
-            # episode_length_buf is remaining steps, so current time = (max - remaining) * dt
-            remaining_steps = env.episode_length_buf.float()  # (num_envs,)
-            max_steps = env.max_episode_length
-            current_time_s = (max_steps - remaining_steps) * env.step_dt
+            elapsed_steps = env.episode_length_buf.float()
+            current_time_s = elapsed_steps * env.step_dt  # elapsed time in seconds
         elif hasattr(env, "_episode_length_buf"):
-            remaining_steps = env._episode_length_buf.float()
-            max_steps = env.max_episode_length
-            current_time_s = (max_steps - remaining_steps) * env.step_dt
-        
+            elapsed_steps = env._episode_length_buf.float()
+            current_time_s = elapsed_steps * env.step_dt
         if current_time_s is not None:
-            # Check if t > T - Tr (in last Tr seconds)
+            # In the last Tr seconds: elapsed > (T - Tr)
             time_threshold = episode_length_s - tr_steps
             time_mask = current_time_s > time_threshold
-            
-            # Scale by 1/Tr and apply time mask
             scaled_reward = soft_reward * (1.0 / tr_steps) * time_mask.float()
         else:
-            # Fallback: apply reward without time restriction (scaled by 1/Tr)
             scaled_reward = soft_reward * (1.0 / tr_steps)
     except (AttributeError, KeyError, TypeError):
-        # Fallback: apply reward without time restriction (scaled by 1/Tr)
         scaled_reward = soft_reward * (1.0 / tr_steps)
     
     return scaled_reward
+
+
+def distance_to_goal_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str = "pose_command",
+    sigma: float = 3.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Dense reward for approaching the goal: every step, closer = higher reward.
+
+    Formula: r = 1/(1 + (distance/sigma)^2). No time window — active entire episode.
+    Gives immediate learning signal to move toward the target.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    target_pos_2d, _ = _get_pose_command_world(env, command_name)
+    if target_pos_2d is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    current_pos = asset.data.root_pos_w[:, :2]
+    error_2d = current_pos - target_pos_2d
+    distance = torch.linalg.norm(error_2d, dim=-1)
+    return 1.0 / (1.0 + torch.square(distance / sigma))
 
 
 def postight(
@@ -562,63 +610,33 @@ def postight(
         Tight position tracking reward (scaled by 1/Tr, only active in last Tr seconds).
     """
     asset: Articulation = env.scene[asset_cfg.name]
-    
-    # Get target position from command
-    # For pose commands, format is typically [x, y, heading] or [x, y, z, heading]
-    cmd = env.command_manager.get_command(command_name)  # shape (N, 3) or (N, 4)
-    
-    # Extract target x, y (first two components)
-    if cmd.shape[1] >= 2:
-        target_pos_2d = cmd[:, :2]  # (num_envs, 2)
-    else:
-        target_pos_2d = cmd[:, :2]  # Fallback
-    
-    # Get current robot position (x, y only for 2D navigation)
+    target_pos_2d, _ = _get_pose_command_world(env, command_name)
+    if target_pos_2d is None:
+        return torch.zeros(env.num_envs, device=env.device)
     current_pos = asset.data.root_pos_w[:, :2]  # (num_envs, 2)
-    
-    # Compute position error
-    error_2d = current_pos - target_pos_2d  # (num_envs, 2)
+    error_2d = current_pos - target_pos_2d
     error_norm = torch.linalg.norm(error_2d, dim=-1)  # (num_envs,)
-    
-    # Soft function: 1/(1 + (error/sigma)^2)
-    # With smaller sigma (0.5 m), this provides tighter tracking
     soft_reward = 1.0 / (1.0 + torch.square(error_norm / sigma))
-    
-    # Get episode time information
-    # Check if we're in the last Tr seconds of the episode
+    # Get episode time: episode_length_buf is ELAPSED steps (increments each step in ManagerBasedRLEnv)
     try:
-        # Get episode length from termination config
-        episode_length_s = 9.0  # Default
-        if hasattr(env, "cfg") and hasattr(env.cfg, "terminations"):
-            if hasattr(env.cfg.terminations, "time_out"):
-                if hasattr(env.cfg.terminations.time_out, "params"):
-                    episode_length_s = env.cfg.terminations.time_out.params.get("time_out", 9.0)
-        
-        # Get current time in episode
-        # In Isaac Lab, episode_length_buf typically counts remaining steps
+        if hasattr(env, "max_episode_length") and hasattr(env, "step_dt"):
+            episode_length_s = float(env.max_episode_length) * env.step_dt
+        else:
+            episode_length_s = getattr(env, "max_episode_length_s", 8.0)
         current_time_s = None
         if hasattr(env, "episode_length_buf"):
-            # episode_length_buf is remaining steps, so current time = (max - remaining) * dt
-            remaining_steps = env.episode_length_buf.float()  # (num_envs,)
-            max_steps = env.max_episode_length
-            current_time_s = (max_steps - remaining_steps) * env.step_dt
+            elapsed_steps = env.episode_length_buf.float()
+            current_time_s = elapsed_steps * env.step_dt
         elif hasattr(env, "_episode_length_buf"):
-            remaining_steps = env._episode_length_buf.float()
-            max_steps = env.max_episode_length
-            current_time_s = (max_steps - remaining_steps) * env.step_dt
-        
+            elapsed_steps = env._episode_length_buf.float()
+            current_time_s = elapsed_steps * env.step_dt
         if current_time_s is not None:
-            # Check if t > T - Tr (in last Tr seconds)
             time_threshold = episode_length_s - tr_steps
             time_mask = current_time_s > time_threshold
-            
-            # Scale by 1/Tr and apply time mask
             scaled_reward = soft_reward * (1.0 / tr_steps) * time_mask.float()
         else:
-            # Fallback: apply reward without time restriction (scaled by 1/Tr)
             scaled_reward = soft_reward * (1.0 / tr_steps)
     except (AttributeError, KeyError, TypeError):
-        # Fallback: apply reward without time restriction (scaled by 1/Tr)
         scaled_reward = soft_reward * (1.0 / tr_steps)
     
     return scaled_reward
@@ -667,25 +685,12 @@ def heading(
         Heading tracking reward (scaled by 1/Tr, only active in last Tr seconds and when close to goal).
     """
     asset: Articulation = env.scene[asset_cfg.name]
-    
-    # Get command (pose command: [x, y, heading] or [x, y, z, heading])
-    cmd = env.command_manager.get_command(command_name)  # shape (N, 3) or (N, 4)
-    
-    # Extract target position and heading
-    if cmd.shape[1] >= 3:
-        target_pos_2d = cmd[:, :2]  # (num_envs, 2)
-        target_heading = cmd[:, 2] if cmd.shape[1] == 3 else cmd[:, 3]  # heading is 3rd or 4th component
-    else:
-        target_pos_2d = cmd[:, :2]
-        target_heading = torch.zeros(env.num_envs, device=env.device)
-    
-    # Get current robot position and heading
+    target_pos_2d, target_heading = _get_pose_command_world(env, command_name)
+    if target_pos_2d is None:
+        return torch.zeros(env.num_envs, device=env.device)
     current_pos = asset.data.root_pos_w[:, :2]  # (num_envs, 2)
-    
-    # Compute distance to goal
     error_2d = current_pos - target_pos_2d
     distance_to_goal = torch.linalg.norm(error_2d, dim=-1)  # (num_envs,)
-    
     # Get current robot yaw angle
     _, _, current_yaw = math_utils.euler_xyz_from_quat(asset.data.root_quat_w)  # (num_envs,)
     
@@ -702,35 +707,29 @@ def heading(
     # Soft function: 1/(1 + (error/sigma)^2)
     soft_reward = 1.0 / (1.0 + torch.square(heading_error_abs / sigma))
     
-    # Get episode time information
-    # Check if we're in the last Tr seconds of the episode
+    # Get episode time: use same T as time_out so "last Tr seconds" matches env
+    _dbg_ep_s = None
+    _dbg_cur_t = None
     try:
-        # Get episode length from termination config
-        episode_length_s = 9.0  # Default
-        if hasattr(env, "cfg") and hasattr(env.cfg, "terminations"):
-            if hasattr(env.cfg.terminations, "time_out"):
-                if hasattr(env.cfg.terminations.time_out, "params"):
-                    episode_length_s = env.cfg.terminations.time_out.params.get("time_out", 9.0)
-        
-        # Get current time in episode
+        if hasattr(env, "max_episode_length") and hasattr(env, "step_dt"):
+            episode_length_s = float(env.max_episode_length) * env.step_dt
+        else:
+            episode_length_s = getattr(env, "max_episode_length_s", 8.0)
+        _dbg_ep_s = float(episode_length_s) if isinstance(episode_length_s, (int, float)) else None
         current_time_s = None
         if hasattr(env, "episode_length_buf"):
-            remaining_steps = env.episode_length_buf.float()  # (num_envs,)
-            max_steps = env.max_episode_length
-            current_time_s = (max_steps - remaining_steps) * env.step_dt
+            elapsed_steps = env.episode_length_buf.float()
+            current_time_s = elapsed_steps * env.step_dt
         elif hasattr(env, "_episode_length_buf"):
-            remaining_steps = env._episode_length_buf.float()
-            max_steps = env.max_episode_length
-            current_time_s = (max_steps - remaining_steps) * env.step_dt
-        
+            elapsed_steps = env._episode_length_buf.float()
+            current_time_s = elapsed_steps * env.step_dt
+        _dbg_cur_t = current_time_s
         if current_time_s is not None:
-            # Check if t > T - Tr (in last Tr seconds)
             time_threshold = episode_length_s - tr_steps
-            time_mask = current_time_s > time_threshold
+            time_mask = current_time_s > time_threshold  # True in last Tr seconds
         else:
             time_mask = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
     except (AttributeError, KeyError, TypeError):
-        # Fallback: assume we're in the time window
         time_mask = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
     
     # Disable heading reward when distance to goal > σsoft
@@ -739,6 +738,21 @@ def heading(
     
     # Combine masks: must be in time window AND close to goal
     combined_mask = time_mask & distance_mask
+    
+    # Temporary debug: log mask means every N calls
+    if _DEBUG_HEADING_STAND_LOG_INTERVAL > 0:
+        _DEBUG_heading_calls[0] += 1
+        if _DEBUG_heading_calls[0] % _DEBUG_HEADING_STAND_LOG_INTERVAL == 1:
+            tm = time_mask.float().mean().cpu().item()
+            dm = distance_mask.float().mean().cpu().item()
+            cm = combined_mask.float().mean().cpu().item()
+            dist_mean = distance_to_goal.mean().cpu().item()
+            cur_t_mean = _dbg_cur_t.mean().cpu().item() if _dbg_cur_t is not None else -1.0
+            print(
+                f"[heading] call #{_DEBUG_heading_calls[0]} | T={_dbg_ep_s} tr_steps={tr_steps} sigma_soft={sigma_soft} | "
+                f"time_mask.mean()={tm:.4f} distance_mask.mean()={dm:.4f} combined.mean()={cm:.4f} | "
+                f"distance_to_goal.mean()={dist_mean:.3f} current_time_s.mean()={cur_t_mean:.3f}"
+            )
     
     # Scale by 1/Tr and apply combined mask
     scaled_reward = soft_reward * (1.0 / tr_steps) * combined_mask.float()
@@ -826,47 +840,35 @@ def stand(
     # Compute L1 norm: ||q - q̄||₁
     joint_error = current_joint_pos - nominal_pos_tensor  # (num_envs, num_joints)
     l1_norm = torch.sum(torch.abs(joint_error), dim=-1)  # (num_envs,)
-    
-    # Get distance to goal
-    cmd = env.command_manager.get_command(command_name)  # shape (N, 3) or (N, 4)
-    if cmd.shape[1] >= 2:
-        target_pos_2d = cmd[:, :2]  # (num_envs, 2)
-    else:
-        target_pos_2d = cmd[:, :2]
-    
+    target_pos_2d, _ = _get_pose_command_world(env, command_name)
+    if target_pos_2d is None:
+        return torch.zeros(env.num_envs, device=env.device)
     current_pos = asset.data.root_pos_w[:, :2]  # (num_envs, 2)
     error_2d = current_pos - target_pos_2d
     distance_to_goal = torch.linalg.norm(error_2d, dim=-1)  # (num_envs,)
-    
-    # Get episode time information
-    # Check if we're in the last Tr,stand seconds of the episode
+    # Get episode time: use same T as time_out so "last Tr,stand seconds" matches env
+    _dbg_ep_s = None
+    _dbg_cur_t = None
     try:
-        # Get episode length from termination config
-        episode_length_s = 9.0  # Default
-        if hasattr(env, "cfg") and hasattr(env.cfg, "terminations"):
-            if hasattr(env.cfg.terminations, "time_out"):
-                if hasattr(env.cfg.terminations.time_out, "params"):
-                    episode_length_s = env.cfg.terminations.time_out.params.get("time_out", 9.0)
-        
-        # Get current time in episode
+        if hasattr(env, "max_episode_length") and hasattr(env, "step_dt"):
+            episode_length_s = float(env.max_episode_length) * env.step_dt
+        else:
+            episode_length_s = getattr(env, "max_episode_length_s", 8.0)
+        _dbg_ep_s = float(episode_length_s) if isinstance(episode_length_s, (int, float)) else None
         current_time_s = None
         if hasattr(env, "episode_length_buf"):
-            remaining_steps = env.episode_length_buf.float()  # (num_envs,)
-            max_steps = env.max_episode_length
-            current_time_s = (max_steps - remaining_steps) * env.step_dt
+            elapsed_steps = env.episode_length_buf.float()
+            current_time_s = elapsed_steps * env.step_dt
         elif hasattr(env, "_episode_length_buf"):
-            remaining_steps = env._episode_length_buf.float()
-            max_steps = env.max_episode_length
-            current_time_s = (max_steps - remaining_steps) * env.step_dt
-        
+            elapsed_steps = env._episode_length_buf.float()
+            current_time_s = elapsed_steps * env.step_dt
+        _dbg_cur_t = current_time_s
         if current_time_s is not None:
-            # Check if t > T - Tr,stand (in last Tr,stand seconds)
             time_threshold = episode_length_s - tr_stand
-            time_mask = current_time_s > time_threshold
+            time_mask = current_time_s > time_threshold  # True in last Tr,stand seconds
         else:
             time_mask = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
     except (AttributeError, KeyError, TypeError):
-        # Fallback: assume we're in the time window
         time_mask = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
     
     # Only active when distance to goal < σtight
@@ -874,6 +876,21 @@ def stand(
     
     # Combine masks: must be in time window AND very close to goal
     combined_mask = time_mask & distance_mask
+    
+    # Temporary debug: log mask means every N calls
+    if _DEBUG_HEADING_STAND_LOG_INTERVAL > 0:
+        _DEBUG_stand_calls[0] += 1
+        if _DEBUG_stand_calls[0] % _DEBUG_HEADING_STAND_LOG_INTERVAL == 1:
+            tm = time_mask.float().mean().cpu().item()
+            dm = distance_mask.float().mean().cpu().item()
+            cm = combined_mask.float().mean().cpu().item()
+            dist_mean = distance_to_goal.mean().cpu().item()
+            cur_t_mean = _dbg_cur_t.mean().cpu().item() if _dbg_cur_t is not None else -1.0
+            print(
+                f"[stand]   call #{_DEBUG_stand_calls[0]} | T={_dbg_ep_s} tr_stand={tr_stand} sigma_tight={sigma_tight} | "
+                f"time_mask.mean()={tm:.4f} distance_mask.mean()={dm:.4f} combined.mean()={cm:.4f} | "
+                f"distance_to_goal.mean()={dist_mean:.3f} current_time_s.mean()={cur_t_mean:.3f}"
+            )
     
     # Scale by 1/Tr,stand and apply combined mask
     scaled_penalty = l1_norm * (1.0 / tr_stand) * combined_mask.float()
@@ -921,21 +938,12 @@ def agile(
     import math
     
     asset: Articulation = env.scene[asset_cfg.name]
-    
-    # Get command to extract goal position
-    cmd = env.command_manager.get_command(command_name)  # shape (N, 3) or (N, 4)
-    if cmd.shape[1] >= 2:
-        target_pos_2d = cmd[:, :2]  # (num_envs, 2)
-    else:
-        target_pos_2d = cmd[:, :2]
-    
-    # Get current robot position
+    target_pos_2d, _ = _get_pose_command_world(env, command_name)
+    if target_pos_2d is None:
+        return torch.zeros(env.num_envs, device=env.device)
     current_pos = asset.data.root_pos_w[:, :2]  # (num_envs, 2)
-    
-    # Compute distance to goal
     error_2d = current_pos - target_pos_2d
     distance_to_goal = torch.linalg.norm(error_2d, dim=-1)  # (num_envs,)
-    
     # Get forward velocity vx in robot base frame
     base_quat = asset.data.root_quat_w
     base_lin_vel_w = asset.data.root_lin_vel_w[:, :2]  # Only x, y components in world frame
@@ -972,18 +980,17 @@ def agile(
     # Check if correct direction: angle < threshold (105°)
     correct_direction_mask = angle_deg < correct_direction_threshold  # (num_envs,)
     
-    # Term 1: relu(vx/vmax) * 1(correct direction)
-    # relu(vx/vmax) = max(0, vx/vmax)
-    normalized_vx = vx / vmax  # (num_envs,)
-    relu_vx = torch.clamp(normalized_vx, min=0.0)  # relu: max(0, vx/vmax)
-    term1 = relu_vx * correct_direction_mask.float()  # (num_envs,)
-    
+    # Term 1a: relu(vx/vmax) * 1(correct direction) — 朝前且朝向正确时给奖
+    normalized_vx = vx / vmax
+    relu_vx = torch.clamp(normalized_vx, min=0.0)
+    term1a = relu_vx * correct_direction_mask.float()
+    # Term 1b: 朝目标方向的速度分量（任意朝向只要在往目标走就给奖，利于迅速接近目标）
+    vel_toward_goal = torch.sum(base_lin_vel_w * to_goal_dir, dim=-1)  # (num_envs,)
+    term1b = torch.clamp(vel_toward_goal / vmax, min=0.0)
+    term1 = torch.maximum(term1a, term1b)
     # Term 2: 1(d_goal < σtight)
-    term2 = (distance_to_goal < sigma_tight).float()  # (num_envs,)
-    
-    # Take maximum of the two terms
-    agile_reward = torch.maximum(term1, term2)  # (num_envs,)
-    
+    term2 = (distance_to_goal < sigma_tight).float()
+    agile_reward = torch.maximum(term1, term2)
     return agile_reward
 
 
@@ -1020,21 +1027,12 @@ def stall(
     import math
     
     asset: Articulation = env.scene[asset_cfg.name]
-    
-    # Get command to extract goal position
-    cmd = env.command_manager.get_command(command_name)  # shape (N, 3) or (N, 4)
-    if cmd.shape[1] >= 2:
-        target_pos_2d = cmd[:, :2]  # (num_envs, 2)
-    else:
-        target_pos_2d = cmd[:, :2]
-    
-    # Get current robot position
+    target_pos_2d, _ = _get_pose_command_world(env, command_name)
+    if target_pos_2d is None:
+        return torch.zeros(env.num_envs, device=env.device)
     current_pos = asset.data.root_pos_w[:, :2]  # (num_envs, 2)
-    
-    # Compute distance to goal
     error_2d = current_pos - target_pos_2d
     distance_to_goal = torch.linalg.norm(error_2d, dim=-1)  # (num_envs,)
-    
     # Check if robot is static (low velocity)
     base_lin_vel_w = asset.data.root_lin_vel_w[:, :2]  # (num_envs, 2)
     velocity_magnitude = torch.linalg.norm(base_lin_vel_w, dim=-1)  # (num_envs,)
