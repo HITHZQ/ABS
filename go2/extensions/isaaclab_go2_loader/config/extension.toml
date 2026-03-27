@@ -1,0 +1,16 @@
+[package]
+version = "0.1.0"
+title = "ABS Go2 Gym registration"
+description = "Imports pip package `go2` so official train.py / play.py can use Unitree-Go2-Velocity* tasks."
+readme = "README.md"
+category = "robotics"
+keywords = ["rl", "go2", "gymnasium"]
+
+[dependencies]
+"isaaclab" = {}
+
+[core]
+reloadable = true
+
+[[python.module]]
+name = "isaaclab_go2_loader"

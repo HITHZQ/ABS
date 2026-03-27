@@ -1,0 +1,15 @@
+__init__.py
+play_go2.py
+setup.py
+train_go2.py
+velocity_env_cfg.py
+./__init__.py
+./camrec.py
+./play_go2.py
+./train_depth_resnet.py
+./train_go2.py
+./velocity_env_cfg.py
+go2.egg-info/PKG-INFO
+go2.egg-info/SOURCES.txt
+go2.egg-info/dependency_links.txt
+go2.egg-info/top_level.txt
