@@ -1,0 +1,315 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{times}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage[numbers,sort&compress]{natbib}
+
+\title{\textbf{Tiny VLA Teams: Efficient Multi-Agent Reinforcement Learning\\
+for Language-Conditioned Robotic Manipulation}}
+
+\author{
+Anonymous Authors\\
+\texttt{replace-with-author-emails}
+}
+
+\date{\today}
+
+\newcommand{\method}{CoVLA}
+\newcommand{\liberocoop}{LIBERO-Coop}
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Vision-Language-Action (VLA) models have enabled language-conditioned robotic manipulation by mapping visual observations and natural-language instructions directly to continuous robot actions. However, recent progress has largely focused on scaling monolithic policies for single-agent or centrally controlled settings. Such scaling can be expensive and brittle for long-horizon tasks that naturally require multiple robots to coordinate, divide work, avoid interference, and exchange task-relevant visual information. We study an alternative question: can teams of lightweight VLA agents provide a more efficient path to collaborative manipulation than a single large VLA controller?
+
+We propose \method{}, a multi-agent reinforcement learning framework for coordinating lightweight VLA policies. \method{} decomposes language instructions into subgoal graphs, dynamically assigns subgoals to agents, exchanges compact VLA latent tokens rather than raw images or text messages, and trains decentralized VLA actors with a multimodal centralized critic. To evaluate language-conditioned cooperative manipulation, we introduce \liberocoop{}, a benchmark covering parallel cooperation, sequential dependency, handoff, and interference-heavy manipulation tasks. The intended empirical study compares tiny VLA teams against single-agent VLAs, centralized large VLA controllers, classical multi-agent visual policies, and alternative communication schemes under matched robot-team settings and deployment budgets. This manuscript is an arXiv-ready draft template: all experimental numbers marked as TBD must be replaced by measured results before scientific submission.
+\end{abstract}
+
+\section{Introduction}
+
+Generalist robotic manipulation increasingly relies on Vision-Language-Action (VLA) policies that condition low-level actions on images and natural-language commands. Systems such as RT-2~\citep{brohan2023rt2}, OpenVLA~\citep{kim2024openvla}, Octo~\citep{octo2024}, $\pi_0$~\citep{black2024pi0}, and efficient variants such as VLA-Adapter~\citep{wang2025vlaadapter} demonstrate that large-scale vision-language pretraining can provide useful semantic priors for robotic control. Yet many household, industrial, and service-robot tasks are not naturally single-agent. Washing dishes, stocking shelves, assembling objects, or handing tools between robots require multiple agents to divide subtasks, share partial observations, avoid collisions, and coordinate timing.
+
+A straightforward solution is to scale a single VLA into a centralized controller that observes all robots and outputs all actions. This approach is conceptually simple, but it raises three difficulties. First, centralized action spaces grow with the number of robots, increasing the burden on the action decoder. Second, a monolithic controller can be costly to deploy on edge robots, especially when low latency is required. Third, centralized policies may overfit to a fixed team size and sensing configuration, making them brittle under partial observability or robot dropout.
+
+Classical multi-agent reinforcement learning (MARL) provides tools for decentralized execution and centralized training~\citep{lowe2017maddpg,yu2022mappo}, but standard MARL agents lack the open-vocabulary language understanding and visual priors that make VLAs attractive. Conversely, recent multi-robot or multi-embodiment VLA systems show promising collaborative behavior, but often rely on prompting, imitation learning, shared policies, or high-level planning rather than explicitly optimizing coordination through MARL.
+
+This paper explores a complementary direction: \emph{coordinate multiple tiny VLA agents instead of scaling one monolithic VLA}. Each agent runs a lightweight VLA actor, receives an assigned subgoal, observes its local view, and exchanges only compact latent messages with teammates. During training, a centralized critic sees multimodal team state and provides stable credit assignment. During deployment, actors remain decentralized and can run in parallel.
+
+\paragraph{Core hypothesis.}
+For long-horizon language-conditioned cooperative manipulation, a team of lightweight VLA agents equipped with learned subgoal assignment, latent communication, and centralized training can achieve a better success-efficiency trade-off than a single large VLA controller under matched multi-robot settings.
+
+\paragraph{Contributions.}
+This draft is structured around four contributions:
+\begin{enumerate}
+    \item We formulate \textbf{language-conditioned cooperative manipulation with VLA teams}, a multi-agent partially observable decision problem in which each robot is controlled by a VLA actor.
+    \item We propose \method{}, a MARL framework combining subgoal-graph assignment, VLA latent communication, decentralized lightweight VLA actors, and a multimodal centralized critic.
+    \item We introduce \liberocoop{}, a benchmark design for evaluating parallel, sequential, handoff, and interference-heavy collaborative manipulation.
+    \item We outline a systematic evaluation of success rate, communication bandwidth, inference latency, memory, trainable parameters, and team-size scaling behavior.
+\end{enumerate}
+
+\section{Related Work}
+
+\paragraph{Vision-Language-Action models.}
+VLA models map multimodal observations and language commands to robot actions. RT-1~\citep{brohan2022rt1} and RT-2~\citep{brohan2023rt2} demonstrated that large-scale vision-language representations can be adapted to robotic control. OpenVLA~\citep{kim2024openvla} released a 7B open-source VLA trained on diverse robot demonstrations, while OpenVLA-OFT explored optimized fine-tuning for high-frequency continuous control. Octo~\citep{octo2024}, $\pi_0$~\citep{black2024pi0}, and other generalist policies further expanded the space of pretrained robotic policies. Efficient VLA methods, including VLA-Adapter~\citep{wang2025vlaadapter}, suggest that small backbones can be competitive when visual-language features are bridged to action space effectively. Our work builds on this efficiency trend but studies \emph{team-level} coordination among lightweight VLAs.
+
+\paragraph{Multi-agent reinforcement learning.}
+Centralized training with decentralized execution (CTDE) is a standard paradigm in MARL. MADDPG~\citep{lowe2017maddpg}, MAPPO~\citep{yu2022mappo}, and related algorithms train critics with global information while deploying decentralized actors. These methods have been applied to cooperative navigation, games, and multi-robot control. However, conventional MARL policies are usually trained from scratch and do not directly address open-language task specification or VLA action decoders. \method{} adapts CTDE to lightweight VLA actors by using VLA latent states and language-conditioned subgoals in the centralized critic.
+
+\paragraph{Multi-robot and collaborative manipulation.}
+Multi-robot manipulation includes bimanual control, handoff, object transport, and collision-aware coordination. Classical approaches often rely on task-and-motion planning, hand-designed roles, or centralized policies. Recent VLM/VLA systems have begun to explore multi-embodiment and multi-robot collaboration, including shared VLA policies or high-level language-based coordination. Our focus is narrower and more algorithmic: how to train multiple small VLA actors to coordinate through learned latent communication and MARL, and how this compares fairly with large VLA controllers under the same number of robots.
+
+\paragraph{Communication in multi-agent systems.}
+Communication can be implemented through discrete symbols, natural language, learned continuous vectors, or shared observations. Text communication is interpretable but can be slow and lossy for geometric control. Raw image sharing preserves information but has high bandwidth and privacy costs. We instead communicate compact latent tokens extracted from VLA encoders or action-bridge modules. This design aims to preserve task-relevant visual-action semantics while remaining efficient enough for parallel robotic execution.
+
+\section{Problem Formulation}
+
+We model language-conditioned cooperative manipulation as a multi-agent partially observable Markov decision process:
+\[
+\mathcal{M} = \langle \mathcal{S}, \{\mathcal{O}_i\}_{i=1}^{N}, \{\mathcal{A}_i\}_{i=1}^{N}, P, R, \gamma, x \rangle,
+\]
+where $N$ is the number of robot agents, $s_t \in \mathcal{S}$ is the latent global state, $o^i_t \in \mathcal{O}_i$ is the local observation of agent $i$, $a^i_t \in \mathcal{A}_i$ is its continuous action, $P$ is the transition function, $R$ is a team reward, $\gamma$ is the discount factor, and $x$ is a natural-language instruction.
+
+Each VLA actor receives its local observation, the global instruction, an assigned subgoal, and messages from teammates:
+\[
+\pi_{\theta_i}(a^i_t \mid o^i_t, x, g^i_t, m^{-i}_t).
+\]
+The communication message $m^i_t$ is produced by compressing the agent's VLA latent representation:
+\[
+z^i_t = f_{\mathrm{vla}}(o^i_t, x, g^i_t), \qquad
+m^i_t = C_{\phi}(z^i_t),
+\]
+where $C_{\phi}$ is a lightweight message compressor. During centralized training, a critic estimates team value from all agents' latent states, subgoals, and optional privileged simulator state:
+\[
+V_{\psi}(s_t, z^1_t,\ldots,z^N_t, g^1_t,\ldots,g^N_t).
+\]
+At deployment, privileged state is removed and each actor uses only its own observation, assigned subgoal, and received messages.
+
+\section{\liberocoop{} Benchmark Design}
+
+\liberocoop{} is designed to test whether a method can coordinate multiple VLA agents under natural-language task specifications. The benchmark should include train/test splits over instructions, object combinations, layouts, and team sizes. We propose four task families.
+
+\subsection{Parallel Cooperation}
+Tasks can be decomposed into independent subtasks that benefit from parallel execution. Example:
+\begin{quote}
+\emph{``Put the cup on the plate and place the spoon in the bowl.''}
+\end{quote}
+Success requires both placements. Metrics include completion time, subgoal success rate, and idle time per agent.
+
+\subsection{Sequential Dependency}
+Some subtasks unlock later subtasks. Example:
+\begin{quote}
+\emph{``Open the drawer, put the cup inside, and close the drawer.''}
+\end{quote}
+One robot may open the drawer while another prepares the cup. Success requires correct ordering and final state.
+
+\subsection{Handoff Cooperation}
+Tasks require physical transfer between robots. Example:
+\begin{quote}
+\emph{``Pass the block from the left robot to the right robot and place it on the shelf.''}
+\end{quote}
+These tasks evaluate timing, spatial alignment, and communication.
+
+\subsection{Interference Avoidance}
+Robots share a workspace where naive parallel execution causes collisions or blocking. Example:
+\begin{quote}
+\emph{``Pick the two objects from crossing regions and place them into the matching bins.''}
+\end{quote}
+Metrics include collision rate, path interference, and recovery after blocked motions.
+
+\begin{table}[t]
+\centering
+\caption{Proposed \liberocoop{} task categories. Numbers are placeholders to be finalized after benchmark implementation.}
+\label{tab:benchmark}
+\begin{tabular}{lccc}
+\toprule
+Category & Example tasks & Agents & Key skill \\
+\midrule
+Parallel cooperation & TBD & 2--3 & Work division \\
+Sequential dependency & TBD & 2--3 & Temporal coordination \\
+Handoff cooperation & TBD & 2 & Physical transfer \\
+Interference avoidance & TBD & 2--5 & Collision-aware coordination \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Method: \method{}}
+
+\subsection{Lightweight VLA Agents}
+Each robot is controlled by a lightweight VLA actor. In the intended implementation, the backbone can be VLA-Adapter-style: a small vision-language model provides multimodal features, and a compact policy module maps action-query latents to continuous action chunks. Most backbone parameters can be frozen during MARL fine-tuning, while communication, assignment, policy adapters, and critic parameters remain trainable.
+
+\subsection{Subgoal Graph Generation}
+Given a language instruction $x$, a subgoal generator produces a directed acyclic graph $G=(\mathcal{V},\mathcal{E})$, where nodes are subgoals and edges encode dependencies. For example:
+\[
+\texttt{open drawer} \rightarrow \texttt{place cup in drawer} \rightarrow \texttt{close drawer}.
+\]
+The graph can be generated by a small language model, a structured parser, or templates in early experiments. We treat graph generation as an interface rather than the main novelty; the central problem is how to assign and execute subgoals under uncertainty.
+
+\subsection{Learned Agent-Subgoal Assignment}
+An assignment policy maps available subgoals to agents:
+\[
+\rho_{\omega}(g^i_t \mid G_t, z^i_t, h^i_t, q_t),
+\]
+where $h^i_t$ summarizes agent history and $q_t$ represents task progress. The assignment policy can reallocate subgoals when an agent fails, becomes blocked, or observes a relevant object. This differs from static language decomposition: execution feedback can change the allocation.
+
+\subsection{Latent Communication}
+Communication is performed in VLA latent space. Each agent sends compressed latent tokens:
+\[
+m^i_t = C_{\phi}(z^i_t) \in \mathbb{R}^{K \times d_m},
+\]
+where $K$ is the communication budget. A receiving agent fuses teammate messages through cross-attention:
+\[
+\tilde{z}^i_t = \mathrm{Fuse}(z^i_t, \{m^j_t\}_{j\neq i}).
+\]
+The action decoder then predicts an action chunk from $\tilde{z}^i_t$. Compared with text messages, latent messages can encode geometric relations, object poses, and teammate occupancy. Compared with raw image sharing, they are compact and can be bandwidth-limited.
+
+\subsection{Multimodal Centralized Critic}
+The centralized critic receives all VLA latents, subgoal embeddings, and optional privileged state:
+\[
+V_{\psi} = V_{\psi}(s_t, \{z^i_t\}_{i=1}^{N}, \{g^i_t\}_{i=1}^{N}, \{a^i_t\}_{i=1}^{N}).
+\]
+The critic is multimodal because it combines language-conditioned VLA features, continuous actions, object state, and coordination signals such as collision/contact events. Training can use MAPPO-style clipped policy optimization with generalized advantage estimation. The reward is shared across agents:
+\[
+R_t = R_{\mathrm{success}} + R_{\mathrm{subgoal}} + R_{\mathrm{progress}}
+ + R_{\mathrm{coord}} + R_{\mathrm{spec}}
+ - R_{\mathrm{collision}} - R_{\mathrm{time}} - R_{\mathrm{energy}}.
+\]
+
+\subsection{Training Procedure}
+\begin{enumerate}
+    \item Collect or generate demonstrations for each \liberocoop{} task.
+    \item Behavior-clone individual lightweight VLA agents on subgoal-conditioned demonstrations.
+    \item Initialize subgoal assignment with heuristics or language-model decomposition.
+    \item Fine-tune communication, assignment, adapters, and critic with MARL.
+    \item Evaluate decentralized actors with communication under held-out tasks, layouts, and language paraphrases.
+\end{enumerate}
+
+\section{Experimental Plan}
+
+This section specifies the experiments required to validate the hypothesis. Numerical values are intentionally marked TBD and must be replaced by measured results.
+
+\subsection{Research Questions}
+\begin{description}
+    \item[RQ1:] Does \method{} improve cooperative manipulation success compared with tiny VLA, large VLA, and non-VLA MARL baselines?
+    \item[RQ2:] Is latent communication more effective or efficient than no communication, text communication, raw observation sharing, or generic learned vectors?
+    \item[RQ3:] Which components of \method{} are necessary?
+    \item[RQ4:] Do tiny VLA teams provide a better success-efficiency trade-off than monolithic large VLA controllers?
+    \item[RQ5:] How does performance change with team size?
+\end{description}
+
+\subsection{Baselines}
+\begin{enumerate}
+    \item Single tiny VLA controlling one robot.
+    \item Single large VLA controlling one robot.
+    \item Large VLA centralized controller producing actions for the same number of robots as \method{}.
+    \item Multi-tiny VLA without communication.
+    \item Multi-tiny VLA with text communication.
+    \item Multi-tiny VLA with raw observation sharing.
+    \item Multi-tiny VLA with rule-based assignment.
+    \item MAPPO visual policy without VLA pretraining.
+    \item \method{} full model.
+\end{enumerate}
+
+\begin{table*}[t]
+\centering
+\caption{Main result table template. Replace TBD with measured success rates and confidence intervals.}
+\label{tab:main}
+\begin{tabular}{lccccc}
+\toprule
+Method & Parallel & Sequential & Handoff & Interference & Average \\
+\midrule
+Single tiny VLA & TBD & TBD & TBD & TBD & TBD \\
+Single large VLA & TBD & TBD & TBD & TBD & TBD \\
+Large VLA, centralized multi-robot & TBD & TBD & TBD & TBD & TBD \\
+Multi tiny VLA, no communication & TBD & TBD & TBD & TBD & TBD \\
+Multi tiny VLA, text communication & TBD & TBD & TBD & TBD & TBD \\
+Multi tiny VLA, raw sharing & TBD & TBD & TBD & TBD & TBD \\
+MAPPO visual policy & TBD & TBD & TBD & TBD & TBD \\
+\method{} full & TBD & TBD & TBD & TBD & TBD \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{table}[t]
+\centering
+\caption{Communication ablation template.}
+\label{tab:comm}
+\begin{tabular}{lcccc}
+\toprule
+Communication & Success & Latency & Bandwidth & Collisions \\
+\midrule
+None & TBD & TBD & TBD & TBD \\
+Text & TBD & TBD & TBD & TBD \\
+Raw image & TBD & TBD & TBD & TBD \\
+Generic vector & TBD & TBD & TBD & TBD \\
+VLA latent tokens & TBD & TBD & TBD & TBD \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Module ablation template.}
+\label{tab:ablation}
+\begin{tabular}{lc}
+\toprule
+Variant & Average success \\
+\midrule
+\method{} full & TBD \\
+w/o learned assignment & TBD \\
+w/o latent communication & TBD \\
+w/o centralized critic & TBD \\
+w/o specialization reward & TBD \\
+w/o VLA pretraining & TBD \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Efficiency comparison template.}
+\label{tab:efficiency}
+\begin{tabular}{lcccc}
+\toprule
+Method & Params & VRAM & Latency & Success/VRAM \\
+\midrule
+Large VLA & TBD & TBD & TBD & TBD \\
+Large VLA centralized & TBD & TBD & TBD & TBD \\
+Tiny VLA team & TBD & TBD & TBD & TBD \\
+\method{} & TBD & TBD & TBD & TBD \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Team-Size Scaling}
+We evaluate $N \in \{1,2,3,4,5\}$ agents under fixed task families and communication budgets. The expected analysis is not a universal scaling law, but a \emph{team-size scaling behavior}: simple tasks may saturate with one or two agents, long-horizon cooperative tasks may benefit from two or three agents, and larger teams may suffer from coordination overhead. This experiment should report success, latency, collision rate, idle time, and communication bandwidth.
+
+\section{Illustrative Case Study: Dishwashing}
+
+Consider the instruction:
+\begin{quote}
+\emph{``Wash the dirty plate, rinse it, dry it, and place it on the rack.''}
+\end{quote}
+A subgoal graph contains locating the plate, grasping it, moving it to the sink, turning on the faucet, picking up a sponge, scrubbing, rinsing, drying, and placing the plate on the rack. A plausible three-agent allocation is: agent 1 handles the plate, agent 2 handles sponge and towel tools, and agent 3 controls the faucet and sink area. During execution, agent 3's visual latent message can encode faucet state, water-stream location, and occupied workspace; agent 1 can use that latent to orient the plate under water; agent 2 can coordinate sponge contact while avoiding collision with agent 1. The dishwashing example motivates the need for latent geometric communication, although fluid simulation and cleanliness metrics are complex; therefore it is best used as a qualitative demonstration rather than the first benchmark target.
+
+\section{Limitations and Ethical Considerations}
+
+This manuscript is a research draft. It should not be uploaded as a completed empirical paper until all TBD values are replaced by measured results and the benchmark is released or described sufficiently for reproduction. Key limitations include: (1) simulated manipulation may not capture deformable materials, fluids, or real contact dynamics; (2) language-model subgoal generation can fail under ambiguous instructions; (3) centralized critics may rely on privileged information unavailable in the real world; (4) scaling beyond five agents may require more structured communication; and (5) real-robot validation is necessary before deployment claims.
+
+Multi-robot systems also require safety constraints, collision checking, human-aware operation, and fail-safe mechanisms. Communication modules should avoid leaking sensitive camera information when deployed in private environments; latent communication can reduce but not automatically eliminate privacy risks.
+
+\section{Conclusion}
+
+We presented \method{}, a proposed framework for coordinating teams of lightweight VLA agents through latent communication and multi-agent reinforcement learning. The central claim is not that multi-robot VLA systems are new, but that MARL-trained tiny VLA teams may offer an efficient alternative to monolithic large VLA controllers for language-conditioned collaborative manipulation. A complete empirical validation requires \liberocoop{}, fair multi-robot baselines, communication ablations, efficiency measurements, and team-size scaling analysis.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
